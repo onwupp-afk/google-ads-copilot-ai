@@ -34,6 +34,9 @@ async function main() {
   const env = resolveEnv();
   await ensurePrisma(env.sessionDbAbsolute);
 
+  console.log(`SHOPIFY_APP_URL → ${env.appUrl}`);
+  console.log(`SHOPIFY_API_KEY → ${env.apiKey}`);
+
   const session = await ensureOfflineSession(env.shopDomain);
 
   const tokenState = await getTokenState(env, session);

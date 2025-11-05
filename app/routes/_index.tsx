@@ -1,6 +1,7 @@
 // Public Landing Page — not embedded in Shopify.
 
-import type { MetaFunction } from "@remix-run/node";
+import type { LoaderFunctionArgs, MetaFunction } from "@remix-run/node";
+import { redirect } from "@remix-run/node";
 import { Link } from "@remix-run/react";
 import { motion } from "framer-motion";
 
@@ -12,6 +13,19 @@ export const meta: MetaFunction = () => [
       "Google Ads Copilot AI keeps your Google Ads and Shopping campaigns compliant with automated policy intelligence, AI rewrite suggestions, and agency-ready dashboards.",
   },
 ];
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const url = new URL(request.url);
+  const hasEmbeddedParams =
+    url.searchParams.has("host") || url.searchParams.has("embedded");
+
+  if (hasEmbeddedParams) {
+    const search = url.searchParams.toString();
+    throw redirect(`/app${search ? `?${search}` : ""}`);
+  }
+
+  return null;
+}
 
 const SECTION_VARIANTS = {
   hidden: { opacity: 0, y: 32 },
