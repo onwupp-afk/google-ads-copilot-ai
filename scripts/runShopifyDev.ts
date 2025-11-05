@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { spawn } from "node:child_process";
+import prisma from "../app/db.server";
 
 const shopDomain = process.env.SHOP_DOMAIN?.trim();
 
@@ -10,19 +11,33 @@ if (!shopDomain) {
   process.exit(1);
 }
 
-const child = spawn(
-  "shopify",
-  ["app", "dev", "--store", shopDomain],
-  {
-    stdio: "inherit",
-    env: process.env,
-  },
-);
-
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
-    return;
+async function bootstrap() {
+  try {
+    const shopCount = await prisma.shop.count();
+    console.log(`🎉 Database connected and ready (shops: ${shopCount})`);
+  } catch (error) {
+    console.error("❌ Failed to connect to the database", error);
+    process.exit(1);
+  } finally {
+    await prisma.$disconnect();
   }
-  process.exit(code ?? 0);
-});
+
+  const child = spawn(
+    "shopify",
+    ["app", "dev", "--store", shopDomain],
+    {
+      stdio: "inherit",
+      env: process.env,
+    },
+  );
+
+  child.on("exit", (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code ?? 0);
+  });
+}
+
+bootstrap();

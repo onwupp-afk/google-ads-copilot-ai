@@ -33,6 +33,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shopFromQuery = url.searchParams.get("shop") ?? undefined;
   const shop = shopFromQuery || session?.shop;
 
+  // Log request context to aid diagnosing embedded auth issues in production.
+  console.info("[app.loader] request", {
+    path: url.pathname,
+    hostParamPresent: Boolean(host),
+    shopFromQuery: shopFromQuery ?? null,
+    sessionShop: session?.shop ?? null,
+  });
+
   if (!shop) {
     throw redirect("/auth/login");
   }

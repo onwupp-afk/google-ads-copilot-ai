@@ -1,18 +1,16 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// Prisma schema for Google Ads Copilot AI
+// Learn more: https://pris.ly/d/prisma-schema
 
 generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
+// Shopify session store
 model Session {
   id            String    @id
   shop          String
@@ -29,4 +27,46 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// Registered Shopify shops
+model Shop {
+  id        String   @id @default(uuid()) @db.Uuid
+  domain    String   @unique
+  plan      String?
+  country   String?
+  currency  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  scans     Scan[]
+}
+
+model Scan {
+  id        String   @id @default(uuid()) @db.Uuid
+  shopId    String   @db.Uuid
+  shop      Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  market    String
+  category  String
+  status    String   @default("pending")
+  createdAt DateTime @default(now())
+  audits    Audit[]
+
+  @@index([shopId])
+  @@index([status])
+}
+
+model Audit {
+  id         String   @id @default(uuid()) @db.Uuid
+  scanId     String   @db.Uuid
+  scan       Scan     @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  ruleCode   String
+  severity   String
+  message    String
+  suggestion String?
+  createdAt  DateTime @default(now())
+
+  @@index([scanId])
+  @@index([ruleCode])
 }

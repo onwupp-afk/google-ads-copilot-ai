@@ -260,20 +260,14 @@ function PreviewSection() {
         <div className="md:w-1/2">
           <div className="relative rounded-[2.75rem] border border-slate-100 bg-white p-8 shadow-xl shadow-slate-900/10">
             <div className="absolute inset-0 -translate-y-4 rounded-[2.75rem] bg-gradient-to-tr from-slate-100 via-white to-white blur-2xl" />
-            <div className="relative overflow-hidden rounded-[2rem] border border-slate-200 bg-gradient-to-br from-white via-slate-50 to-slate-100">
-              <img
-                src="/images/dashboard-preview.png"
-                alt="Google Ads Copilot AI dashboard preview"
-                className="hidden w-full object-cover md:block"
-              />
-              <div className="flex h-64 flex-col items-center justify-center gap-2 text-center text-slate-500 md:hidden">
-                <span className="text-sm uppercase tracking-[0.4em]">
-                  Dashboard preview
-                </span>
-                <span className="text-xs text-slate-400">
-                  Add /images/dashboard-preview.png for a custom mockup.
-                </span>
-              </div>
+            <div className="relative flex h-64 flex-col justify-center gap-4 rounded-[2rem] border border-slate-200 bg-gradient-to-br from-white via-slate-50 to-slate-100 px-8 text-center">
+              <span className="text-xs uppercase tracking-[0.4em] text-slate-400">
+                Compliance cockpit
+              </span>
+              <p className="text-sm text-slate-600">
+                Visualize policy posture, triage AI rewrites, and export evidence. Replace this panel
+                with a real screenshot once your production dashboard is ready.
+              </p>
             </div>
           </div>
         </div>
