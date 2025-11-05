@@ -63,6 +63,7 @@
     "@vercel/remix": "^2.16.7",
     "eslint": "^8.42.0",
     "eslint-config-prettier": "^10.0.1",
+    "postcss-custom-media": "^11.0.6",
     "prettier": "^3.2.4",
     "typescript": "^5.2.2",
     "vite": "^6.2.2"
