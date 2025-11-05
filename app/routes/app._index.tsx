@@ -1,29 +1,56 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useOutletContext } from "@remix-run/react";
+import { useLoaderData, useOutletContext } from "@remix-run/react";
 import {
   Badge,
   BlockStack,
   Card,
   DataTable,
   InlineGrid,
+  InlineStack,
   Layout,
   Page,
+  Tabs,
   Text,
 } from "@shopify/polaris";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { useScanData } from "../hooks/useScanData";
+import DashboardSummary from "../components/DashboardSummary";
+import StatsGrid from "../components/StatsGrid";
 import type { AppContext } from "./app";
+
+type DashboardLoaderData = {
+  complianceScore: number;
+  violationsResolved: number;
+  activeMarkets: string[];
+  nextScanIn: string;
+  lastScanTimestamp: string;
+};
+
+const TABS = [
+  { id: "overview", content: "Overview" },
+  { id: "violations", content: "Violations" },
+  { id: "queue", content: "Remediation Queue" },
+];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
-  return json({});
+  return json<DashboardLoaderData>({
+    complianceScore: 94,
+    violationsResolved: 28,
+    activeMarkets: ["UK", "EU", "US", "AU"],
+    nextScanIn: "2h",
+    lastScanTimestamp: "2025-11-05T15:00:00Z",
+  });
 };
 
 export default function Dashboard() {
+  const { complianceScore, violationsResolved, activeMarkets, nextScanIn, lastScanTimestamp } =
+    useLoaderData<typeof loader>();
   const { host, shop } = useOutletContext<AppContext>();
   const scanData = useScanData();
+  const [selectedTab, setSelectedTab] = useState(0);
 
   const formatter = useMemo(
     () =>
@@ -39,23 +66,23 @@ export default function Dashboard() {
     return `${path}?${params.toString()}`;
   };
 
-  const metrics = [
-    {
-      title: "Average compliance score",
-      value: `${scanData.complianceScore}%`,
-      helpText: "Weighted by policy severity across all markets.",
-    },
-    {
-      title: "Active violations",
-      value: `${scanData.activeViolations}`,
-      helpText: "Open issues awaiting review or rewrite.",
-    },
-    {
-      title: "Last scan completed",
-      value: formatter.format(new Date(scanData.lastScan)),
-      helpText: "Latest automated audit across your catalogs.",
-    },
-  ];
+  const scanRows = scanData.scans.map((scan) => {
+    const statusTone =
+      scan.status === "Completed"
+        ? "success"
+        : scan.status === "Running"
+          ? "info"
+          : "attention";
+    return [
+      formatter.format(new Date(scan.runAt)),
+      scan.market,
+      <Badge key={`${scan.id}-status`} tone={statusTone}>
+        {scan.status}
+      </Badge>,
+      `${scan.violations}`,
+      `${scan.aiFixes}`,
+    ];
+  });
 
   const issueRows = scanData.issues.map((issue) => {
     const badgeTone =
@@ -67,87 +94,109 @@ export default function Dashboard() {
     return [
       issue.market,
       issue.issue,
-      <Badge key={issue.id} tone={badgeTone}>
+      <Badge key={`${issue.id}-severity`} tone={badgeTone}>
         {issue.severity}
-      </Badge>,
-    ];
-  });
-
-  const scanRows = scanData.scans.map((scan) => {
-    const statusTone =
-      scan.status === "Completed"
-        ? "success"
-        : scan.status === "Running"
-          ? "info"
-          : "attention";
-    return [
-      formatter.format(new Date(scan.runAt)),
-      scan.market,
-      `${scan.violations}`,
-      `${scan.aiFixes}`,
-      <Badge key={scan.id} tone={statusTone}>
-        {scan.status}
       </Badge>,
     ];
   });
 
   return (
     <Page
-      title="Compliance Overview"
-      subtitle="Monitor policy health, investigate violations, and launch targeted scans."
+      title="Policy Operations"
+      subtitle="Agency-grade insight into AI-driven Google Ads & Shopping compliance."
       primaryAction={{
-        content: "Run New Scan",
+        content: "Run Scan",
         url: buildEmbeddedUrl("/app/scans"),
       }}
     >
       <Layout>
         <Layout.Section>
-          <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
-            {metrics.map((metric) => (
-              <Card key={metric.title} padding="500">
-                <BlockStack gap="200">
-                  <Text variant="headingMd" as="h2">
-                    {metric.title}
-                  </Text>
-                  <Text variant="heading2xl" as="p">
-                    {metric.value}
-                  </Text>
-                  <Text tone="subdued" as="p">
-                    {metric.helpText}
-                  </Text>
-                </BlockStack>
-              </Card>
-            ))}
-          </InlineGrid>
+          <DashboardSummary
+            appName="Google Ads Copilot AI"
+            tagline="Policy Intelligence That Fixes Itself"
+            lastScan={formatter.format(new Date(lastScanTimestamp))}
+            nextScanIn={nextScanIn}
+          />
         </Layout.Section>
-        <Layout.Section variant="twoThirds">
+
+        <Layout.Section>
+          <StatsGrid
+            complianceScore={complianceScore}
+            violationsResolved={violationsResolved}
+            activeMarkets={activeMarkets}
+          />
+        </Layout.Section>
+
+        <Layout.Section>
           <Card>
-            <BlockStack gap="300">
-              <Text variant="headingMd" as="h3">
-                Latest Scan Activity
-              </Text>
-              <DataTable
-                columnContentTypes={["text", "text", "numeric", "numeric", "text"]}
-                headings={["Run at", "Market", "Violations", "AI fixes", "Status"]}
-                rows={scanRows}
-                showTotalsInFooter={false}
-              />
-            </BlockStack>
+            <Tabs
+              tabs={TABS}
+              selected={selectedTab}
+              onSelect={setSelectedTab}
+              fitted
+            >
+              <Card.Section>
+                {selectedTab === 0 && (
+                  <Text as="p" tone="subdued">
+                    Monitor campaign health, approvals, and AI actions at a glance. This workspace
+                    keeps client teams, performance marketers, and compliance leads on the same page.
+                  </Text>
+                )}
+                {selectedTab === 1 && (
+                  <Text as="p" tone="subdued">
+                    Violations are prioritized by impact and market. Each entry includes AI rationale
+                    and suggested copy rewrites so stakeholders can approve fixes without deep
+                    platform knowledge.
+                  </Text>
+                )}
+                {selectedTab === 2 && (
+                  <Text as="p" tone="subdued">
+                    The remediation queue tracks AI-generated actions awaiting human approval. Connect
+                    this view to your agency&apos;s QA flow or automate approvals with guardrails.
+                  </Text>
+                )}
+              </Card.Section>
+            </Tabs>
           </Card>
         </Layout.Section>
+
+        <Layout.Section variant="twoThirds">
+          <Card>
+            <Card.Header title="Recent scans" />
+            <Card.Section>
+              <DataTable
+                columnContentTypes={["text", "text", "text", "numeric", "numeric"]}
+                headings={["Completed", "Market", "Status", "Violations", "AI fixes"]}
+                rows={scanRows}
+              />
+            </Card.Section>
+          </Card>
+        </Layout.Section>
+
         <Layout.Section variant="oneThird">
           <Card>
-            <BlockStack gap="300">
-              <Text variant="headingMd" as="h3">
-                Highest Priority Issues
-              </Text>
+            <Card.Header title="Priority issues" />
+            <Card.Section>
               <DataTable
                 columnContentTypes={["text", "text", "text"]}
                 headings={["Market", "Issue", "Severity"]}
                 rows={issueRows}
-                showTotalsInFooter={false}
               />
-            </BlockStack>
+            </Card.Section>
+            <Card.Section subdued>
+              <InlineStack align="space-between">
+                <Text tone="subdued" as="p">
+                  Connected markets
+                </Text>
+                <InlineGrid columns="auto" gap="200">
+                  {activeMarkets.map((market) => (
+                    <Badge key={`${market}-active`} tone="subdued">
+                      {market}
+                    </Badge>
+                  ))}
+                </InlineGrid>
+              </InlineStack>
+            </Card.Section>
           </Card>
         </Layout.Section>
       </Layout>

@@ -1,6 +1,7 @@
 import "dotenv/config";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -21,6 +22,10 @@ type EnvConfig = {
   envPath: string;
   adminToken: string | null;
   authLoginUrl: string;
+  apiKey: string;
+  scopes: string;
+  authCallbackUrl: string;
+  environment: "production" | "development";
 };
 
 let prisma: PrismaClient | null = null;
@@ -29,60 +34,68 @@ async function main() {
   const env = resolveEnv();
   await ensurePrisma(env.sessionDbAbsolute);
 
-  const sessionId = await ensureOfflineSession(env.shopDomain);
+  const session = await ensureOfflineSession(env.shopDomain);
 
-  let existingToken =
-    env.adminToken && env.adminToken.length > 0
-      ? env.adminToken
-      : await attemptTokenLookup(env.shopDomain);
+  const tokenState = await getTokenState(env, session);
 
-  if (!existingToken) {
-    console.log("ℹ️ No Admin API token detected — starting OAuth handshake.");
-    await performHandshake(env);
-    existingToken = await attemptTokenLookup(env.shopDomain);
-  } else {
-    console.log(
-      `ℹ️ Existing Admin API token detected (token ${maskToken(existingToken)}) — syncing.`,
-    );
-  }
-
-  if (!existingToken) {
-    const sqliteToken = await verifyWithSqlite(
-      env.sessionDbAbsolute,
-      env.shopDomain,
-    );
-    existingToken = sqliteToken ?? null;
-  }
-
-  if (!existingToken) {
-    console.error("❌ OAuth handshake failed — no token available after retry.");
-    process.exitCode = 1;
+  if (tokenState.status === "valid") {
+    console.log("✅ Existing token valid — skipping OAuth");
+    await upsertEnvToken(env.envPath, tokenState.token);
+    await upsertSessionToken(session.id, tokenState.token);
     await disconnectPrisma();
     return;
   }
 
-  await upsertEnvToken(env.envPath, existingToken);
-  await upsertSessionToken(sessionId, existingToken);
+  console.log("⚙️ Running OAuth handshake...");
+  await performHandshake(env, session.id);
 
-  console.log("✅ Shopify Admin Token synced successfully.");
+  const refreshedToken = await getTokenState(env, session);
+  if (refreshedToken.status !== "valid") {
+    const fallback = await verifyWithSqlite(
+      env.sessionDbAbsolute,
+      env.shopDomain,
+    );
+    if (!fallback) {
+      console.error("❌ OAuth handshake failed — no token available after retry.");
+      process.exitCode = 1;
+      await disconnectPrisma();
+      return;
+    }
+    await upsertEnvTokenWithRetry(env.envPath, fallback);
+    await upsertSessionToken(session.id, fallback);
+    console.log("🔑 Token received and stored successfully (SQLite fallback).");
+    await disconnectPrisma();
+    return;
+  }
+
+  await upsertEnvTokenWithRetry(env.envPath, refreshedToken.token);
+  await upsertSessionToken(session.id, refreshedToken.token);
+
+  console.log("🔑 Token received and stored successfully");
 
   await disconnectPrisma();
 }
 
-async function performHandshake(env: EnvConfig) {
-  const handshakeUrl =
-    env.authLoginUrl ||
-    `${stripTrailingSlash(env.appUrl)}/auth/login?shop=${encodeURIComponent(env.shopDomain)}`;
-  console.log(`Opening OAuth handshake: ${handshakeUrl}`);
+async function performHandshake(env: EnvConfig, sessionId: string) {
+  const redirectUri = env.environment === "production"
+    ? "https://aithorapp.co.uk/api/auth/callback"
+    : env.authCallbackUrl || `${stripTrailingSlash(env.appUrl)}/api/auth/callback`;
 
-  await open(handshakeUrl);
+  const state = generateState(sessionId);
+  const installUrl = `https://${env.shopDomain}/admin/oauth/install?client_id=${encodeURIComponent(
+    env.apiKey,
+  )}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(
+    env.scopes,
+  )}&state=${encodeURIComponent(state)}`;
+
+  console.log(`🌐 Opening install URL: ${installUrl}`);
+
+  await open(installUrl);
 
   try {
     const token = await waitForToken(env.shopDomain);
-    await upsertEnvToken(env.envPath, token);
-    console.log(
-      `✅ OAuth handshake complete for ${env.shopDomain} — .env updated (token ${maskToken(token)})`,
-    );
+    await upsertEnvTokenWithRetry(env.envPath, token);
+    await upsertSessionToken(sessionId, token);
   } catch (error) {
     console.error(
       "❌ Timed out waiting for the Admin API token. Approve the app in the Shopify window, then rerun npm run auto:oauth.",
@@ -140,6 +153,14 @@ function resolveEnv(): EnvConfig {
       process.env.SHOPIFY_AUTH_LOGIN_URL.trim().length > 0
         ? stripTrailingSlash(process.env.SHOPIFY_AUTH_LOGIN_URL.trim())
         : "",
+    apiKey: requireEnv("SHOPIFY_API_KEY"),
+    scopes: requireEnv("SCOPES"),
+    authCallbackUrl:
+      process.env.SHOPIFY_AUTH_CALLBACK_URL &&
+      process.env.SHOPIFY_AUTH_CALLBACK_URL.trim().length > 0
+        ? process.env.SHOPIFY_AUTH_CALLBACK_URL.trim()
+        : `${stripTrailingSlash(rawAppUrl)}/auth/callback`,
+    environment: process.env.NODE_ENV === "production" ? "production" : "development",
   };
 }
 
@@ -292,6 +313,20 @@ async function upsertEnvToken(envPath: string, token: string) {
   );
 }
 
+async function upsertEnvTokenWithRetry(envPath: string, token: string, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      await upsertEnvToken(envPath, token);
+      return;
+    } catch (error) {
+      console.error(`Failed to update .env on attempt ${attempt}`, error);
+      if (attempt === retries) {
+        throw error;
+      }
+    }
+  }
+}
+
 async function verifyWithSqlite(dbPath: string, shopDomain: string) {
   try {
     const { stdout } = await execFileAsync("sqlite3", [
@@ -337,7 +372,9 @@ function maskToken(token: string | null) {
   return token.length > 6 ? `${token.slice(0, 6)}…` : token;
 }
 
-async function ensureOfflineSession(shopDomain: string) {
+type SessionSnapshot = { id: string; accessToken: string | null; expires: Date | null };
+
+async function ensureOfflineSession(shopDomain: string): Promise<SessionSnapshot> {
   if (!prisma) {
     throw new Error("Prisma client not initialised");
   }
@@ -351,7 +388,11 @@ async function ensureOfflineSession(shopDomain: string) {
   });
 
   if (existing) {
-    return existing.id;
+    return {
+      id: existing.id,
+      accessToken: existing.accessToken,
+      expires: existing.expires ?? null,
+    };
   }
 
   await prisma.session.create({
@@ -365,7 +406,11 @@ async function ensureOfflineSession(shopDomain: string) {
     },
   });
 
-  return offlineId;
+  return {
+    id: offlineId,
+    accessToken: "",
+    expires: null,
+  };
 }
 
 async function upsertSessionToken(sessionId: string, token: string) {
@@ -382,6 +427,36 @@ async function upsertSessionToken(sessionId: string, token: string) {
       isOnline: false,
     },
   });
+}
+
+async function getTokenState(env: EnvConfig, session: SessionSnapshot) {
+  const latestSession = await prisma!.session.findUnique({
+    where: { id: session.id },
+  });
+
+  const token =
+    latestSession?.accessToken ||
+    session.accessToken ||
+    env.adminToken ||
+    (await attemptTokenLookup(env.shopDomain)) ||
+    null;
+
+  if (!token) {
+    return { status: "missing" as const, token: null };
+  }
+
+  const expires = latestSession?.expires ?? session.expires;
+  if (expires && expires <= new Date()) {
+    console.warn("Detected expired Admin API token — forcing re-handshake.");
+    return { status: "expired" as const, token: null };
+  }
+
+  return { status: "valid" as const, token };
+}
+
+function generateState(seed: string) {
+  const random = randomUUID ? randomUUID() : Math.random().toString(36).slice(2);
+  return `${seed}-${random}`;
 }
 
 main().catch(async (error) => {

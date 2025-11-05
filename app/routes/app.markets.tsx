@@ -4,9 +4,8 @@ import { useOutletContext } from "@remix-run/react";
 import {
   Badge,
   BlockStack,
-  Button,
   Card,
-  DataTable,
+  InlineGrid,
   Layout,
   Page,
   Text,
@@ -24,62 +23,54 @@ export default function Markets() {
   const { host, shop } = useOutletContext<AppContext>();
   const scanData = useScanData();
 
-  const buildEmbeddedUrl = (path: string) => {
-    const params = new URLSearchParams({ host, shop });
-    return `${path}?${params.toString()}`;
-  };
-
-  const rows = scanData.markets.map((market) => {
+  const marketCards = scanData.markets.map((market) => {
     const tone =
       market.compliance >= 90
         ? "success"
         : market.compliance >= 80
           ? "attention"
           : "critical";
-    return [
-      market.region,
-      `${market.policyPack} v${market.version}`,
-      <Badge key={market.id} tone={tone}>
-        {market.compliance}%
-      </Badge>,
-      <Button
-        key={`${market.id}-update`}
-        size="slim"
-        url={buildEmbeddedUrl(`/app/markets?focus=${market.id}`)}
-      >
-        Update rule pack
-      </Button>,
-    ];
+    return (
+      <Card key={market.id} padding="500">
+        <BlockStack gap="200">
+          <Text variant="headingSm" as="h3">
+            {market.region}
+          </Text>
+          <Text tone="subdued" as="p">
+            {market.policyPack} · v{market.version}
+          </Text>
+          <Badge tone={tone}>{market.compliance}% compliant</Badge>
+          <Text as="p" tone="subdued">
+            Guardrails synced with Google Ads policies for this region.
+          </Text>
+        </BlockStack>
+      </Card>
+    );
   });
 
   return (
     <Page
       title="Markets"
       subtitle="Manage localized policy packs and track market-specific compliance."
-      primaryAction={{
-        content: "Add Market",
-        url: buildEmbeddedUrl("/app/markets?modal=add"),
-      }}
     >
       <Layout>
         <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text variant="headingMd" as="h2">
-                Policy pack coverage
-              </Text>
-              <DataTable
-                columnContentTypes={["text", "text", "text", "text"]}
-                headings={[
-                  "Market",
-                  "Policy pack",
-                  "Compliance",
-                  "Actions",
-                ]}
-                rows={rows}
-              />
-            </BlockStack>
-          </Card>
+          <BlockStack gap="400">
+            <Card>
+              <BlockStack gap="200">
+                <Text variant="headingMd" as="h2">
+                  Active markets
+                </Text>
+                <Text tone="subdued" as="p">
+                  Each market applies localized policy packs, rewrite playbooks, and monitoring
+                  schedules. Adjust pack strictness in settings to align with client expectations.
+                </Text>
+              </BlockStack>
+            </Card>
+            <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
+              {marketCards}
+            </InlineGrid>
+          </BlockStack>
         </Layout.Section>
       </Layout>
     </Page>

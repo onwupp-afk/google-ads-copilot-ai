@@ -1,6 +1,6 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useOutletContext } from "@remix-run/react";
 import {
   Badge,
@@ -25,9 +25,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export default function Scans() {
   const { host, shop } = useOutletContext<AppContext>();
   const scanData = useScanData();
-  const [selectedScanId, setSelectedScanId] = useState(
-    scanData.scans[0]?.id ?? "",
-  );
 
   const formatter = useMemo(
     () =>
@@ -43,7 +40,9 @@ export default function Scans() {
     return `${path}?${params.toString()}`;
   };
 
-  const rows = scanData.scans.map((scan) => {
+  const durations = ["3m 12s", "6m 08s", "4m 41s"];
+
+  const rows = scanData.scans.map((scan, index) => {
     const tone =
       scan.status === "Completed"
         ? "success"
@@ -53,24 +52,15 @@ export default function Scans() {
     return [
       formatter.format(new Date(scan.runAt)),
       scan.market,
-      `${scan.violations}`,
-      `${scan.aiFixes}`,
       <Badge key={`${scan.id}-status`} tone={tone}>
         {scan.status}
       </Badge>,
-      <Button
-        key={`${scan.id}-view`}
-        plain
-        onClick={() => setSelectedScanId(scan.id)}
-      >
-        View
-      </Button>,
+      `${scan.violations}`,
+      durations[index] ?? "—",
     ];
   });
 
-  const activeScan =
-    scanData.scans.find((scan) => scan.id === selectedScanId) ??
-    scanData.scans[0];
+  const activeScan = scanData.scans[0];
 
   return (
     <Page
@@ -89,14 +79,13 @@ export default function Scans() {
                 Recent scans
               </Text>
               <DataTable
-                columnContentTypes={["text", "text", "numeric", "numeric", "text", "text"]}
+                columnContentTypes={["text", "text", "text", "numeric", "text"]}
                 headings={[
-                  "Run at",
+                  "Date",
                   "Market",
-                  "Violations",
-                  "AI fixes",
                   "Status",
-                  "Details",
+                  "Violations found",
+                  "Duration",
                 ]}
                 rows={rows}
               />
@@ -136,6 +125,18 @@ export default function Scans() {
                       Violations
                     </Text>
                     <Text as="p">{activeScan.violations}</Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text as="span" tone="subdued">
+                      AI fixes applied
+                    </Text>
+                    <Text as="p">{activeScan.aiFixes}</Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text as="span" tone="subdued">
+                      Duration
+                    </Text>
+                    <Text as="p">{durations[0] ?? "—"}</Text>
                   </BlockStack>
                 </InlineGrid>
                 <BlockStack gap="200">

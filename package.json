@@ -27,6 +27,7 @@
     "node": "20.x"
   },
   "dependencies": {
+    "@emotion/is-prop-valid": "^1.4.0",
     "@prisma/client": "latest",
     "@remix-run/dev": "2.16.7",
     "@remix-run/fs-routes": "2.16.7",

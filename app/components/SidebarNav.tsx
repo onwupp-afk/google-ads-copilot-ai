@@ -2,9 +2,8 @@ import { useMemo } from "react";
 import { Navigation } from "@shopify/polaris";
 import type { NavigationProps } from "@shopify/polaris";
 import {
-  ChartLineIcon,
+  ChartHistogramGrowthIcon,
   ClipboardChecklistIcon,
-  CompassIcon,
   GlobeIcon,
   HomeIcon,
   SettingsIcon,
@@ -50,12 +49,12 @@ export function SidebarNav({
           },
           {
             label: "Scans",
-            icon: ChartLineIcon,
+            icon: ChartHistogramGrowthIcon,
             url: `/app/scans${query}`,
             onClick: onNavigate,
           },
           {
-            label: "Audits",
+            label: "Audit Trail",
             icon: ClipboardChecklistIcon,
             url: `/app/audits${query}`,
             onClick: onNavigate,

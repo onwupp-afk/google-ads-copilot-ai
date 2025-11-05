@@ -6,7 +6,7 @@ import {
   BlockStack,
   Button,
   Card,
-  DataTable,
+  InlineStack,
   Layout,
   Page,
   Text,
@@ -39,39 +39,6 @@ export default function Audits() {
     return `${path}?${params.toString()}`;
   };
 
-  const rows = scanData.audits.map((audit) => {
-    const statusTone =
-      audit.score >= 90
-        ? "success"
-        : audit.score >= 80
-          ? "attention"
-          : "critical";
-    return [
-      formatter.format(new Date(audit.runAt)),
-      audit.market,
-      <Badge key={`${audit.id}-score`} tone={statusTone}>
-        {audit.score}%
-      </Badge>,
-      `${audit.fixedPercent}%`,
-      <Button
-        key={`${audit.id}-pdf`}
-        size="slim"
-        variant="secondary"
-        url={buildEmbeddedUrl(`/app/audits/${audit.id}.pdf`)}
-      >
-        Export PDF
-      </Button>,
-      <Button
-        key={`${audit.id}-csv`}
-        size="slim"
-        variant="secondary"
-        url={buildEmbeddedUrl(`/app/audits/${audit.id}.csv`)}
-      >
-        Export CSV
-      </Button>,
-    ];
-  });
-
   return (
     <Page
       title="Audits"
@@ -86,27 +53,59 @@ export default function Audits() {
           <Card>
             <BlockStack gap="300">
               <Text variant="headingMd" as="h2">
-                Audit history
+                Audit trail
               </Text>
-              <DataTable
-                columnContentTypes={[
-                  "text",
-                  "text",
-                  "text",
-                  "numeric",
-                  "text",
-                  "text",
-                ]}
-                headings={[
-                  "Run at",
-                  "Market",
-                  "Score",
-                  "Fixed %",
-                  "Export PDF",
-                  "Export CSV",
-                ]}
-                rows={rows}
-              />
+              <BlockStack gap="400">
+                {scanData.audits.map((audit) => {
+                  const tone =
+                    audit.score >= 90
+                      ? "success"
+                      : audit.score >= 80
+                        ? "attention"
+                        : "critical";
+                  return (
+                    <Card key={audit.id} padding="500" background="bg-surface-secondary">
+                      <BlockStack gap="200">
+                        <InlineStack align="space-between" blockAlign="center">
+                          <BlockStack gap="100">
+                            <Text variant="headingSm" as="h3">
+                              {formatter.format(new Date(audit.runAt))}
+                            </Text>
+                            <Text as="p" tone="subdued">
+                              {audit.market} market · automated policy sweep
+                            </Text>
+                          </BlockStack>
+                          <Badge tone={tone}>{audit.score}% score</Badge>
+                        </InlineStack>
+                        <InlineStack align="space-between">
+                          <Text as="p" tone="subdued">
+                            Fix rate
+                          </Text>
+                          <Text as="p" variant="headingMd">
+                            {audit.fixedPercent}%
+                          </Text>
+                        </InlineStack>
+                        <InlineStack gap="200">
+                          <Button
+                            size="slim"
+                            variant="secondary"
+                            url={buildEmbeddedUrl(`/app/audits/${audit.id}.pdf`)}
+                          >
+                            Export PDF
+                          </Button>
+                          <Button
+                            size="slim"
+                            variant="secondary"
+                            url={buildEmbeddedUrl(`/app/audits/${audit.id}.csv`)}
+                          >
+                            Download CSV
+                          </Button>
+                        </InlineStack>
+                      </BlockStack>
+                    </Card>
+                  );
+                })}
+              </BlockStack>
             </BlockStack>
           </Card>
         </Layout.Section>

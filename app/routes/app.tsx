@@ -3,11 +3,22 @@ import type {
   LoaderFunctionArgs,
 } from "@remix-run/node";
 import { json, redirect } from "@remix-run/node";
-import { Outlet, useLoaderData, useLocation, useRouteError } from "@remix-run/react";
+import {
+  Outlet,
+  useLoaderData,
+  useLocation,
+  useRouteError,
+} from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
-import { Frame, TopBar } from "@shopify/polaris";
+import {
+  Badge,
+  Frame,
+  InlineStack,
+  Text,
+  TopBar,
+} from "@shopify/polaris";
 import { useCallback, useMemo, useState } from "react";
 
 import { authenticate } from "../shopify.server";
@@ -47,6 +58,10 @@ export default function App() {
   const location = useLocation();
   const [isMobileNavActive, setIsMobileNavActive] = useState(false);
   const skipToContentTarget = "AppFrameContent";
+  const storeBadgeLabel = useMemo(
+    () => (shop.endsWith(".myshopify.com") ? shop.replace(".myshopify.com", "") : shop),
+    [shop],
+  );
 
   const handleNavigationToggle = useCallback(() => {
     setIsMobileNavActive((current) => !current);
@@ -58,9 +73,25 @@ export default function App() {
 
   const topBarMarkup = useMemo(
     () => (
-      <TopBar showNavigationToggle onNavigationToggle={handleNavigationToggle} />
+      <TopBar
+        showNavigationToggle
+        onNavigationToggle={handleNavigationToggle}
+        contextControl={
+          <InlineStack gap="200" blockAlign="center">
+            <Text variant="headingSm" as="span">
+              Google Ads Policy Copilot AI
+            </Text>
+            <Badge tone="attention">{storeBadgeLabel}</Badge>
+          </InlineStack>
+        }
+        secondaryMenu={
+          <Text as="span" tone="subdued">
+            Embedded app connected
+          </Text>
+        }
+      />
     ),
-    [handleNavigationToggle],
+    [handleNavigationToggle, storeBadgeLabel],
   );
 
   const navigationMarkup = useMemo(
