@@ -27,8 +27,20 @@ import SidebarNav from "../components/SidebarNav";
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
   const url = new URL(request.url);
+  console.info("[app.loader] start", { path: url.pathname, search: url.search });
+
+  let authResult: Awaited<ReturnType<typeof authenticate.admin>>;
+  try {
+    authResult = await authenticate.admin(request);
+  } catch (error) {
+    console.error("[app.loader] authenticate.admin failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+  const { session } = authResult;
+
   const host = url.searchParams.get("host") ?? undefined;
   const shopFromQuery = url.searchParams.get("shop") ?? undefined;
   const shop = shopFromQuery || session?.shop;
