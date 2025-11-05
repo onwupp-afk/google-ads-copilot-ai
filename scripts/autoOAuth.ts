@@ -20,6 +20,7 @@ type EnvConfig = {
   sessionDbAbsolute: string;
   envPath: string;
   adminToken: string | null;
+  authLoginUrl: string;
 };
 
 let prisma: PrismaClient | null = null;
@@ -28,36 +29,50 @@ async function main() {
   const env = resolveEnv();
   await ensurePrisma(env.sessionDbAbsolute);
 
-  if (!env.adminToken) {
+  const sessionId = await ensureOfflineSession(env.shopDomain);
+
+  let existingToken =
+    env.adminToken && env.adminToken.length > 0
+      ? env.adminToken
+      : await attemptTokenLookup(env.shopDomain);
+
+  if (!existingToken) {
+    console.log("ℹ️ No Admin API token detected — starting OAuth handshake.");
     await performHandshake(env);
+    existingToken = await attemptTokenLookup(env.shopDomain);
   } else {
     console.log(
-      `ℹ️ Existing Admin API token detected (token ${maskToken(env.adminToken)}) — skipping OAuth handshake.`,
+      `ℹ️ Existing Admin API token detected (token ${maskToken(existingToken)}) — syncing.`,
     );
   }
 
-  const latestToken = await attemptTokenLookup(env.shopDomain);
-  if (latestToken) {
-    await upsertEnvToken(env.envPath, latestToken);
+  if (!existingToken) {
+    const sqliteToken = await verifyWithSqlite(
+      env.sessionDbAbsolute,
+      env.shopDomain,
+    );
+    existingToken = sqliteToken ?? null;
   }
 
-  const sqliteToken = await verifyWithSqlite(
-    env.sessionDbAbsolute,
-    env.shopDomain,
-  );
-
-  if (sqliteToken) {
-    console.log("✅ Token retrieved and stored successfully.");
-  } else {
-    console.error("❌ OAuth handshake failed — retrying.");
+  if (!existingToken) {
+    console.error("❌ OAuth handshake failed — no token available after retry.");
     process.exitCode = 1;
+    await disconnectPrisma();
+    return;
   }
+
+  await upsertEnvToken(env.envPath, existingToken);
+  await upsertSessionToken(sessionId, existingToken);
+
+  console.log("✅ Shopify Admin Token synced successfully.");
 
   await disconnectPrisma();
 }
 
 async function performHandshake(env: EnvConfig) {
-  const handshakeUrl = `${stripTrailingSlash(env.appUrl)}/auth/login?shop=${encodeURIComponent(env.shopDomain)}`;
+  const handshakeUrl =
+    env.authLoginUrl ||
+    `${stripTrailingSlash(env.appUrl)}/auth/login?shop=${encodeURIComponent(env.shopDomain)}`;
   console.log(`Opening OAuth handshake: ${handshakeUrl}`);
 
   await open(handshakeUrl);
@@ -120,6 +135,11 @@ function resolveEnv(): EnvConfig {
     sessionDbAbsolute,
     envPath,
     adminToken,
+    authLoginUrl:
+      process.env.SHOPIFY_AUTH_LOGIN_URL &&
+      process.env.SHOPIFY_AUTH_LOGIN_URL.trim().length > 0
+        ? stripTrailingSlash(process.env.SHOPIFY_AUTH_LOGIN_URL.trim())
+        : "",
   };
 }
 
@@ -315,6 +335,53 @@ async function verifyWithSqlite(dbPath: string, shopDomain: string) {
 function maskToken(token: string | null) {
   if (!token) return "unknown";
   return token.length > 6 ? `${token.slice(0, 6)}…` : token;
+}
+
+async function ensureOfflineSession(shopDomain: string) {
+  if (!prisma) {
+    throw new Error("Prisma client not initialised");
+  }
+
+  const offlineId = `offline_${shopDomain}`;
+
+  const existing = await prisma.session.findUnique({
+    where: {
+      id: offlineId,
+    },
+  });
+
+  if (existing) {
+    return existing.id;
+  }
+
+  await prisma.session.create({
+    data: {
+      id: offlineId,
+      shop: shopDomain,
+      state: "offline",
+      isOnline: false,
+      scope: process.env.SCOPES ?? "",
+      accessToken: "",
+    },
+  });
+
+  return offlineId;
+}
+
+async function upsertSessionToken(sessionId: string, token: string) {
+  if (!prisma) {
+    throw new Error("Prisma client not initialised");
+  }
+
+  await prisma.session.update({
+    where: {
+      id: sessionId,
+    },
+    data: {
+      accessToken: token,
+      isOnline: false,
+    },
+  });
 }
 
 main().catch(async (error) => {

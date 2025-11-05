@@ -2,9 +2,10 @@ import { useMemo } from "react";
 import { Navigation } from "@shopify/polaris";
 import type { NavigationProps } from "@shopify/polaris";
 import {
-  AnalyticsIcon,
-  ChecklistIcon,
+  ChartLineIcon,
+  ClipboardChecklistIcon,
   CompassIcon,
+  GlobeIcon,
   HomeIcon,
   SettingsIcon,
 } from "@shopify/polaris-icons";
@@ -43,19 +44,19 @@ export function SidebarNav({
           },
           {
             label: "Markets",
-            icon: CompassIcon,
+            icon: GlobeIcon,
             url: `/app/markets${query}`,
             onClick: onNavigate,
           },
           {
             label: "Scans",
-            icon: AnalyticsIcon,
+            icon: ChartLineIcon,
             url: `/app/scans${query}`,
             onClick: onNavigate,
           },
           {
             label: "Audits",
-            icon: ChecklistIcon,
+            icon: ClipboardChecklistIcon,
             url: `/app/audits${query}`,
             onClick: onNavigate,
           },

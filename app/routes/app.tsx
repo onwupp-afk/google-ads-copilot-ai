@@ -6,7 +6,6 @@ import { json, redirect } from "@remix-run/node";
 import { Outlet, useLoaderData, useLocation, useRouteError } from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
-import { Provider as AppBridgeProvider } from "@shopify/app-bridge-react";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 import { Frame, TopBar } from "@shopify/polaris";
 import { useCallback, useMemo, useState } from "react";
@@ -78,25 +77,17 @@ export default function App() {
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
-      <AppBridgeProvider
-        config={{
-          apiKey,
-          host,
-          forceRedirect: true,
-        }}
+      <Frame
+        topBar={topBarMarkup}
+        navigation={navigationMarkup}
+        skipToContentTarget={skipToContentTarget}
+        showMobileNavigation={isMobileNavActive}
+        onNavigationDismiss={handleNavigationDismiss}
       >
-        <Frame
-          topBar={topBarMarkup}
-          navigation={navigationMarkup}
-          skipToContentTarget={skipToContentTarget}
-          showMobileNavigation={isMobileNavActive}
-          onNavigationDismiss={handleNavigationDismiss}
-        >
-          <div id={skipToContentTarget} style={{ minHeight: "100%" }}>
-            <Outlet context={{ host, shop }} />
-          </div>
-        </Frame>
-      </AppBridgeProvider>
+        <div id={skipToContentTarget} style={{ minHeight: "100%" }}>
+          <Outlet context={{ host, shop }} />
+        </div>
+      </Frame>
     </AppProvider>
   );
 }
