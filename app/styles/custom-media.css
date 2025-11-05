@@ -1,0 +1,5 @@
+@custom-media --p-breakpoints-xs-up (min-width: 0rem);
+@custom-media --p-breakpoints-sm-up (min-width: 30.625rem);
+@custom-media --p-breakpoints-md-up (min-width: 48rem);
+@custom-media --p-breakpoints-lg-up (min-width: 65rem);
+@custom-media --p-breakpoints-xl-up (min-width: 90rem);

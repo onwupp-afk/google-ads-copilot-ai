@@ -28,6 +28,5 @@ scopes = "read_products,write_products,read_content,write_content,read_themes,wr
 redirect_urls = [
   "https://aithorapp.co.uk/api/auth",
   "https://aithorapp.co.uk/auth/callback",
-  "https://aithorapp.co.uk/api/auth/callback",
   "https://aithorapp.co.uk/auth/tokens",
 ]
