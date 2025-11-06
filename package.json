@@ -68,9 +68,6 @@
     "typescript": "^5.2.2",
     "vite": "^6.2.2"
   },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
-  },
   "workspaces": [
     "extensions/*"
   ],

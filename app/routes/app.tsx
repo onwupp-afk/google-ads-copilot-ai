@@ -4,22 +4,27 @@ import { useLoaderData } from "@remix-run/react";
 import { Card, Layout, Page, Text } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 
+function buildLoginRedirect(url: URL) {
+  const shopParam =
+    url.searchParams.get("shop") ?? process.env.SHOP_DOMAIN ?? undefined;
+  if (shopParam) {
+    return redirect(`/auth/login?shop=${shopParam}`);
+  }
+  throw new Response("Missing shop parameter", { status: 400 });
+}
+
 export async function loader({ request }: LoaderFunctionArgs) {
   try {
     const { session } = await authenticate.admin(request);
     const shop = session?.shop;
     if (!shop) {
       const url = new URL(request.url);
-      const shopParam = url.searchParams.get("shop");
-      if (shopParam) return redirect(`/auth/login?shop=${shopParam}`);
-      throw new Response("Missing session", { status: 401 });
+      return buildLoginRedirect(url);
     }
     return json({ shop });
   } catch {
     const url = new URL(request.url);
-    const shopParam = url.searchParams.get("shop");
-    if (shopParam) return redirect(`/auth/login?shop=${shopParam}`);
-    throw new Response("Unauthorized", { status: 401 });
+    return buildLoginRedirect(url);
   }
 }
 
