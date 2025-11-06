@@ -12,6 +12,7 @@ import {
   Tabs,
   Text,
 } from "@shopify/polaris";
+import type { ReactNode } from "react";
 import { useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { useScanData } from "../hooks/useScanData";
@@ -19,17 +20,29 @@ import DashboardSummary from "../components/DashboardSummary";
 import StatsGrid from "../components/StatsGrid";
 import type { AppContext } from "./app";
 
-console.log("[dashboard.module] polaris types", {
-  Page: typeof Page,
-  Layout: typeof Layout,
-  Card: typeof Card,
-  CardSection: typeof (Card as any).Section,
-  Tabs: typeof Tabs,
-  DataTable: typeof DataTable,
-  InlineGrid: typeof InlineGrid,
-  InlineStack: typeof InlineStack,
-  Text: typeof Text,
-});
+type PolarisCardSectionProps = {
+  children: ReactNode;
+  subdued?: boolean;
+};
+
+const PolarisCardSection = ({ children, subdued }: PolarisCardSectionProps) => {
+  const Section = (Card as any)?.Section;
+  if (Section) {
+    return <Section subdued={subdued}>{children}</Section>;
+  }
+
+  return (
+    <div
+      style={{
+        padding: "var(--p-space-500)",
+        background: subdued ? "var(--p-color-bg-surface-tertiary)" : undefined,
+        borderTop: "1px solid var(--p-color-border-subdued)",
+      }}
+    >
+      {children}
+    </div>
+  );
+};
 
 type DashboardLoaderData = {
   complianceScore: number;
@@ -145,7 +158,7 @@ export default function Dashboard() {
               onSelect={setSelectedTab}
               fitted
             >
-              <CardSection>
+              <PolarisCardSection>
                 {selectedTab === 0 && (
                   <Text as="p" tone="subdued">
                     Monitor campaign health, approvals, and AI actions at a glance. This workspace
@@ -165,7 +178,7 @@ export default function Dashboard() {
                     this view to your agency&apos;s QA flow or automate approvals with guardrails.
                   </Text>
                 )}
-              </CardSection>
+              </PolarisCardSection>
             </Tabs>
           </Card>
         </Layout.Section>
@@ -173,27 +186,27 @@ export default function Dashboard() {
         <Layout.Section variant="twoThirds">
           <Card>
             <Card.Header title="Recent scans" />
-            <CardSection>
+            <PolarisCardSection>
               <DataTable
                 columnContentTypes={["text", "text", "text", "numeric", "numeric"]}
                 headings={["Completed", "Market", "Status", "Violations", "AI fixes"]}
                 rows={scanRows}
               />
-            </CardSection>
+            </PolarisCardSection>
           </Card>
         </Layout.Section>
 
         <Layout.Section variant="oneThird">
           <Card>
             <Card.Header title="Priority issues" />
-            <CardSection>
+            <PolarisCardSection>
               <DataTable
                 columnContentTypes={["text", "text", "text"]}
                 headings={["Market", "Issue", "Severity"]}
                 rows={issueRows}
               />
-            </CardSection>
-            <CardSection subdued>
+            </PolarisCardSection>
+            <PolarisCardSection subdued>
               <InlineStack align="space-between">
                 <Text tone="subdued" as="p">
                   Connected markets
@@ -206,7 +219,7 @@ export default function Dashboard() {
                   ))}
                 </InlineGrid>
               </InlineStack>
-            </CardSection>
+            </PolarisCardSection>
           </Card>
         </Layout.Section>
       </Layout>
