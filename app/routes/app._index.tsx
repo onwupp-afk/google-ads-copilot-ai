@@ -19,6 +19,18 @@ import DashboardSummary from "../components/DashboardSummary";
 import StatsGrid from "../components/StatsGrid";
 import type { AppContext } from "./app";
 
+console.log("[dashboard.module] polaris types", {
+  Page: typeof Page,
+  Layout: typeof Layout,
+  Card: typeof Card,
+  CardSection: typeof (Card as any).Section,
+  Tabs: typeof Tabs,
+  DataTable: typeof DataTable,
+  InlineGrid: typeof InlineGrid,
+  InlineStack: typeof InlineStack,
+  Text: typeof Text,
+});
+
 type DashboardLoaderData = {
   complianceScore: number;
   violationsResolved: number;
@@ -133,7 +145,7 @@ export default function Dashboard() {
               onSelect={setSelectedTab}
               fitted
             >
-              <Card.Section>
+              <CardSection>
                 {selectedTab === 0 && (
                   <Text as="p" tone="subdued">
                     Monitor campaign health, approvals, and AI actions at a glance. This workspace
@@ -153,7 +165,7 @@ export default function Dashboard() {
                     this view to your agency&apos;s QA flow or automate approvals with guardrails.
                   </Text>
                 )}
-              </Card.Section>
+              </CardSection>
             </Tabs>
           </Card>
         </Layout.Section>
@@ -161,27 +173,27 @@ export default function Dashboard() {
         <Layout.Section variant="twoThirds">
           <Card>
             <Card.Header title="Recent scans" />
-            <Card.Section>
+            <CardSection>
               <DataTable
                 columnContentTypes={["text", "text", "text", "numeric", "numeric"]}
                 headings={["Completed", "Market", "Status", "Violations", "AI fixes"]}
                 rows={scanRows}
               />
-            </Card.Section>
+            </CardSection>
           </Card>
         </Layout.Section>
 
         <Layout.Section variant="oneThird">
           <Card>
             <Card.Header title="Priority issues" />
-            <Card.Section>
+            <CardSection>
               <DataTable
                 columnContentTypes={["text", "text", "text"]}
                 headings={["Market", "Issue", "Severity"]}
                 rows={issueRows}
               />
-            </Card.Section>
-            <Card.Section subdued>
+            </CardSection>
+            <CardSection subdued>
               <InlineStack align="space-between">
                 <Text tone="subdued" as="p">
                   Connected markets
@@ -194,7 +206,7 @@ export default function Dashboard() {
                   ))}
                 </InlineGrid>
               </InlineStack>
-            </Card.Section>
+            </CardSection>
           </Card>
         </Layout.Section>
       </Layout>
