@@ -24,6 +24,12 @@ import { useCallback, useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import SidebarNav from "../components/SidebarNav";
 
+console.log("[app.module] import types", {
+  AppProvider: typeof AppProvider,
+  Frame: typeof Frame,
+  TopBar: typeof TopBar,
+});
+
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -152,6 +158,12 @@ export default function App() {
     sessionToken,
     persistentSearch,
   } = useLoaderData<typeof loader>();
+  console.log("[app.render] component types", {
+    AppProvider: typeof AppProvider,
+    Frame: typeof Frame,
+    SidebarNav: typeof SidebarNav,
+    TopBar: typeof TopBar,
+  });
   const location = useLocation();
   const [isMobileNavActive, setIsMobileNavActive] = useState(false);
   const skipToContentTarget = "AppFrameContent";
