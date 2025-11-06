@@ -85,6 +85,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         statusText: cloned.statusText,
         headers: Object.fromEntries(cloned.headers.entries()),
         body,
+        forwardedHost,
+        forwardedProto,
+        userAgent: request.headers.get("user-agent"),
       });
     } else {
       console.error("[app.loader] authenticate.admin failed", {
