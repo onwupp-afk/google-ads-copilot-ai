@@ -1,72 +1,29 @@
-import { useMemo } from "react";
-import { Navigation } from "@shopify/polaris";
-import type { NavigationProps } from "@shopify/polaris";
-import {
-  ChartHistogramGrowthIcon,
-  ClipboardChecklistIcon,
-  GlobeIcon,
-  HomeIcon,
-  SettingsIcon,
-} from "@shopify/polaris-icons";
+import { Link } from "@shopify/polaris";
+import { NavLink } from "@remix-run/react";
 
-type SidebarNavProps = {
-  activePath: string;
-  persistentSearch: string | null;
-  onNavigate?: () => void;
-};
+export default function SidebarNav() {
+  const items = [
+    { to: "/app", label: "Home" },
+    { to: "/app/scans", label: "Scans" },
+    { to: "/app/audits", label: "Audits" },
+    { to: "/app/settings", label: "Settings" },
+  ];
 
-export function SidebarNav({
-  activePath,
-  persistentSearch,
-  onNavigate,
-}: SidebarNavProps) {
-  const query = useMemo(
-    () => (persistentSearch && persistentSearch.length > 0 ? `?${persistentSearch}` : ""),
-    [persistentSearch],
+  return (
+    <nav>
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {items.map((item) => (
+          <li key={item.to} style={{ marginBottom: 8 }}>
+            <NavLink to={item.to} prefetch="intent" style={{ textDecoration: "none" }}>
+              {({ isActive }) => (
+                <Link removeUnderline monochrome url={item.to}>
+                  {isActive ? `• ${item.label}` : item.label}
+                </Link>
+              )}
+            </NavLink>
+          </li>
+        ))}
+      </ul>
+    </nav>
   );
-
-  const sections: NavigationProps["sections"] = useMemo(
-    () => [
-      {
-        items: [
-          {
-            label: "Dashboard",
-            icon: HomeIcon,
-            url: `/app${query}`,
-            exactMatch: true,
-            onClick: onNavigate,
-          },
-          {
-            label: "Markets",
-            icon: GlobeIcon,
-            url: `/app/markets${query}`,
-            onClick: onNavigate,
-          },
-          {
-            label: "Scans",
-            icon: ChartHistogramGrowthIcon,
-            url: `/app/scans${query}`,
-            onClick: onNavigate,
-          },
-          {
-            label: "Audit Trail",
-            icon: ClipboardChecklistIcon,
-            url: `/app/audits${query}`,
-            onClick: onNavigate,
-          },
-          {
-            label: "Settings",
-            icon: SettingsIcon,
-            url: `/app/settings${query}`,
-            onClick: onNavigate,
-          },
-        ],
-      },
-    ],
-    [onNavigate, query],
-  );
-
-  return <Navigation location={activePath} sections={sections} />;
 }
-
-export default SidebarNav;
