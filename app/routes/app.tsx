@@ -29,13 +29,8 @@ export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const forwardedHost =
     request.headers.get("x-forwarded-host") ?? request.headers.get("host");
-  if (forwardedHost === "www.aithorapp.co.uk") {
-    const canonicalUrl = new URL(request.url);
-    canonicalUrl.protocol = "https:";
-    canonicalUrl.host = "aithorapp.co.uk";
-    throw redirect(canonicalUrl.toString(), { status: 308 });
-  }
-
+  const forwardedProto =
+    request.headers.get("x-forwarded-proto") ?? "https";
   const url = new URL(request.url);
   console.info("[app.loader] start", { path: url.pathname, search: url.search });
 
@@ -51,6 +46,35 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         body = await cloned.text();
       } catch (bodyError) {
         body = `[body read error: ${bodyError instanceof Error ? bodyError.message : bodyError}]`;
+      }
+      const locationHeader = cloned.headers.get("location");
+      if (locationHeader && forwardedHost) {
+        try {
+          const locationUrl = new URL(locationHeader, `${forwardedProto}://${forwardedHost}`);
+          const reloadParam = locationUrl.searchParams.get("shopify-reload");
+          if (reloadParam) {
+            const reloadUrl = new URL(reloadParam);
+            const expectedOrigin = `${forwardedProto}://${forwardedHost}`;
+            if (reloadUrl.origin !== expectedOrigin) {
+              reloadUrl.protocol = forwardedProto;
+              reloadUrl.host = forwardedHost;
+              locationUrl.searchParams.set(
+                "shopify-reload",
+                reloadUrl.toString(),
+              );
+              const newLocation = `${locationUrl.pathname}?${locationUrl.searchParams.toString()}`;
+              const headers = new Headers(cloned.headers);
+              headers.set("location", newLocation);
+              throw new Response(null, {
+                status: cloned.status,
+                statusText: cloned.statusText,
+                headers,
+              });
+            }
+          }
+        } catch (locationError) {
+          console.error("[app.loader] failed to adjust location header", locationError);
+        }
       }
       console.error("[app.loader] authenticate.admin failed (response)", {
         status: cloned.status,
