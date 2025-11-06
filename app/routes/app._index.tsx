@@ -3,7 +3,6 @@ import { json } from "@remix-run/node";
 import { useLoaderData, useOutletContext } from "@remix-run/react";
 import {
   Badge,
-  BlockStack,
   Card,
   DataTable,
   InlineGrid,
@@ -48,7 +47,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export default function Dashboard() {
   const { complianceScore, violationsResolved, activeMarkets, nextScanIn, lastScanTimestamp } =
     useLoaderData<typeof loader>();
-  const { shop, persistentSearch } = useOutletContext<AppContext>();
+  const { persistentSearch } = useOutletContext<AppContext>();
   const scanData = useScanData();
   const [selectedTab, setSelectedTab] = useState(0);
 

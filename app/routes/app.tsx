@@ -32,7 +32,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const forwardedProto =
     request.headers.get("x-forwarded-proto") ?? "https";
   const url = new URL(request.url);
-  console.info("[app.loader] start", { path: url.pathname, search: url.search });
+  console.log("[app.loader] start", { path: url.pathname, search: url.search });
 
   const searchParams = new URLSearchParams(url.searchParams);
   let authResult: Awaited<ReturnType<typeof authenticate.admin>>;
@@ -65,6 +65,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
               const newLocation = `${locationUrl.pathname}?${locationUrl.searchParams.toString()}`;
               const headers = new Headers(cloned.headers);
               headers.set("location", newLocation);
+              console.log("[app.loader] rewritten shopify-reload", {
+                original: locationHeader,
+                updated: newLocation,
+              });
               throw new Response(null, {
                 status: cloned.status,
                 statusText: cloned.statusText,
@@ -84,7 +88,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       });
     } else {
       console.error("[app.loader] authenticate.admin failed", {
-        message: error instanceof Error ? error.message : String(error),
+        message:
+          error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
       });
     }
     throw error;
@@ -98,7 +104,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const sessionToken = searchParams.get("session_token") ?? undefined;
 
   // Log request context to aid diagnosing embedded auth issues in production.
-  console.info("[app.loader] request", {
+  console.log("[app.loader] request", {
     path: url.pathname,
     hostParamPresent: Boolean(host),
     shopFromQuery: shopFromQuery ?? null,

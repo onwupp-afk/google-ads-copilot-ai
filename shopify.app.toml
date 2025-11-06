@@ -1,6 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "c4e2d2c96c34b0695ec94d7787e204cc"
+client_id = "4e649c39a96df2edc52d05bdf87ce731"
 name = "Google Ads Copilot AI"
 application_url = "https://aithorapp.co.uk"
 embedded = true
