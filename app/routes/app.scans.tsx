@@ -23,7 +23,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export default function Scans() {
-  const { host, shop } = useOutletContext<AppContext>();
+  const { persistentSearch } = useOutletContext<AppContext>();
   const scanData = useScanData();
 
   const formatter = useMemo(
@@ -36,8 +36,7 @@ export default function Scans() {
   );
 
   const buildEmbeddedUrl = (path: string) => {
-    const params = new URLSearchParams({ host, shop });
-    return `${path}?${params.toString()}`;
+    return persistentSearch ? `${path}?${persistentSearch}` : path;
   };
 
   const durations = ["3m 12s", "6m 08s", "4m 41s"];

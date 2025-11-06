@@ -24,15 +24,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export default function Settings() {
-  const { host, shop } = useOutletContext<AppContext>();
+  const { persistentSearch } = useOutletContext<AppContext>();
   const [aiEnabled, setAiEnabled] = useState(true);
   const [complianceMode, setComplianceMode] = useState(["strict"]);
   const [googleAdsConnected] = useState(true);
   const [shopifyMarketsConnected] = useState(true);
 
   const buildEmbeddedUrl = (path: string) => {
-    const params = new URLSearchParams({ host, shop });
-    return `${path}?${params.toString()}`;
+    return persistentSearch ? `${path}?${persistentSearch}` : path;
   };
 
   return (

@@ -60,6 +60,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const host = url.searchParams.get("host") ?? undefined;
   const shopFromQuery = url.searchParams.get("shop") ?? undefined;
   const shop = shopFromQuery || session?.shop;
+  const embedded = url.searchParams.get("embedded") ?? undefined;
+  const sessionToken = url.searchParams.get("session_token") ?? undefined;
 
   // Log request context to aid diagnosing embedded auth issues in production.
   console.info("[app.loader] request", {
@@ -67,6 +69,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     hostParamPresent: Boolean(host),
     shopFromQuery: shopFromQuery ?? null,
     sessionShop: session?.shop ?? null,
+    embedded,
+    sessionTokenPresent: Boolean(sessionToken),
   });
 
   if (!shop) {
@@ -81,16 +85,21 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     apiKey: process.env.SHOPIFY_API_KEY || "",
     host,
     shop,
+    embedded,
+    sessionToken,
   });
 };
 
 export type AppContext = {
   host: string;
   shop: string;
+  persistentSearch: string;
 };
 
 export default function App() {
-  const { apiKey, host, shop } = useLoaderData<typeof loader>();
+  const { apiKey, host, shop, embedded, sessionToken } = useLoaderData<
+    typeof loader
+  >();
   const location = useLocation();
   const [isMobileNavActive, setIsMobileNavActive] = useState(false);
   const skipToContentTarget = "AppFrameContent";
@@ -98,6 +107,16 @@ export default function App() {
     () => (shop.endsWith(".myshopify.com") ? shop.replace(".myshopify.com", "") : shop),
     [shop],
   );
+  const persistentParams = useMemo(() => {
+    const params = new URLSearchParams({ host, shop });
+    if (embedded) {
+      params.set("embedded", embedded);
+    }
+    if (sessionToken) {
+      params.set("session_token", sessionToken);
+    }
+    return params.toString();
+  }, [embedded, host, sessionToken, shop]);
 
   const handleNavigationToggle = useCallback(() => {
     setIsMobileNavActive((current) => !current);
@@ -134,12 +153,11 @@ export default function App() {
     () => (
       <SidebarNav
         activePath={`${location.pathname}${location.search}`}
-        host={host}
-        shop={shop}
+        persistentSearch={persistentParams}
         onNavigate={handleNavigationDismiss}
       />
     ),
-    [handleNavigationDismiss, host, location.pathname, location.search, shop],
+    [handleNavigationDismiss, location.pathname, location.search, persistentParams],
   );
 
   return (
@@ -152,7 +170,7 @@ export default function App() {
         onNavigationDismiss={handleNavigationDismiss}
       >
         <div id={skipToContentTarget} style={{ minHeight: "100%" }}>
-          <Outlet context={{ host, shop }} />
+          <Outlet context={{ host, shop, persistentSearch: persistentParams }} />
         </div>
       </Frame>
     </AppProvider>

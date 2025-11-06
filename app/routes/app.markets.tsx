@@ -1,6 +1,5 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useOutletContext } from "@remix-run/react";
 import {
   Badge,
   BlockStack,
@@ -12,7 +11,6 @@ import {
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import { useScanData } from "../hooks/useScanData";
-import type { AppContext } from "./app";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -20,7 +18,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export default function Markets() {
-  const { host, shop } = useOutletContext<AppContext>();
   const scanData = useScanData();
 
   const marketCards = scanData.markets.map((market) => {

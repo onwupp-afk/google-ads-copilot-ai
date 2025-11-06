@@ -11,24 +11,19 @@ import {
 
 type SidebarNavProps = {
   activePath: string;
-  host: string;
-  shop: string;
+  persistentSearch: string;
   onNavigate?: () => void;
 };
 
 export function SidebarNav({
   activePath,
-  host,
-  shop,
+  persistentSearch,
   onNavigate,
 }: SidebarNavProps) {
-  const query = useMemo(() => {
-    const params = new URLSearchParams({
-      host,
-      shop,
-    });
-    return `?${params.toString()}`;
-  }, [host, shop]);
+  const query = useMemo(
+    () => (persistentSearch ? `?${persistentSearch}` : ""),
+    [persistentSearch],
+  );
 
   const sections: NavigationProps["sections"] = useMemo(
     () => [
