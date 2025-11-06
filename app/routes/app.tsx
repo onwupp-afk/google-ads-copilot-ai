@@ -34,9 +34,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
     authResult = await authenticate.admin(request);
   } catch (error) {
-    console.error("[app.loader] authenticate.admin failed", {
-      message: error instanceof Error ? error.message : String(error),
-    });
+    if (error instanceof Response) {
+      const cloned = error.clone();
+      let body: string | undefined;
+      try {
+        body = await cloned.text();
+      } catch (bodyError) {
+        body = `[body read error: ${bodyError instanceof Error ? bodyError.message : bodyError}]`;
+      }
+      console.error("[app.loader] authenticate.admin failed (response)", {
+        status: cloned.status,
+        statusText: cloned.statusText,
+        headers: Object.fromEntries(cloned.headers.entries()),
+        body,
+      });
+    } else {
+      console.error("[app.loader] authenticate.admin failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     throw error;
   }
   const { session } = authResult;
