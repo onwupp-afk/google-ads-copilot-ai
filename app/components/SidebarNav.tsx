@@ -11,7 +11,7 @@ import {
 
 type SidebarNavProps = {
   activePath: string;
-  persistentSearch: string;
+  persistentSearch: string | null;
   onNavigate?: () => void;
 };
 
@@ -21,7 +21,7 @@ export function SidebarNav({
   onNavigate,
 }: SidebarNavProps) {
   const query = useMemo(
-    () => (persistentSearch ? `?${persistentSearch}` : ""),
+    () => (persistentSearch && persistentSearch.length > 0 ? `?${persistentSearch}` : ""),
     [persistentSearch],
   );
 

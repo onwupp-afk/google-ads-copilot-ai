@@ -27,9 +27,19 @@ import SidebarNav from "../components/SidebarNav";
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const forwardedHost =
+    request.headers.get("x-forwarded-host") ?? request.headers.get("host");
+  if (forwardedHost === "www.aithorapp.co.uk") {
+    const canonicalUrl = new URL(request.url);
+    canonicalUrl.protocol = "https:";
+    canonicalUrl.host = "aithorapp.co.uk";
+    throw redirect(canonicalUrl.toString(), { status: 308 });
+  }
+
   const url = new URL(request.url);
   console.info("[app.loader] start", { path: url.pathname, search: url.search });
 
+  const searchParams = new URLSearchParams(url.searchParams);
   let authResult: Awaited<ReturnType<typeof authenticate.admin>>;
   try {
     authResult = await authenticate.admin(request);
@@ -57,11 +67,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
   const { session } = authResult;
 
-  const host = url.searchParams.get("host") ?? undefined;
-  const shopFromQuery = url.searchParams.get("shop") ?? undefined;
+  const host = searchParams.get("host") ?? undefined;
+  const shopFromQuery = searchParams.get("shop") ?? undefined;
   const shop = shopFromQuery || session?.shop;
-  const embedded = url.searchParams.get("embedded") ?? undefined;
-  const sessionToken = url.searchParams.get("session_token") ?? undefined;
+  const embedded = searchParams.get("embedded") ?? undefined;
+  const sessionToken = searchParams.get("session_token") ?? undefined;
 
   // Log request context to aid diagnosing embedded auth issues in production.
   console.info("[app.loader] request", {
@@ -78,8 +88,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 
   if (!host) {
+    searchParams.set("shop", shop);
     throw redirect(`/auth/login?shop=${encodeURIComponent(shop)}`);
   }
+
+  const persistentSearch = searchParams.toString();
 
   return json({
     apiKey: process.env.SHOPIFY_API_KEY || "",
@@ -87,19 +100,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     shop,
     embedded,
     sessionToken,
+    persistentSearch,
   });
 };
 
 export type AppContext = {
   host: string;
   shop: string;
-  persistentSearch: string;
+  persistentSearch: string | null;
 };
 
 export default function App() {
-  const { apiKey, host, shop, embedded, sessionToken } = useLoaderData<
-    typeof loader
-  >();
+  const {
+    apiKey,
+    host,
+    shop,
+    embedded,
+    sessionToken,
+    persistentSearch,
+  } = useLoaderData<typeof loader>();
   const location = useLocation();
   const [isMobileNavActive, setIsMobileNavActive] = useState(false);
   const skipToContentTarget = "AppFrameContent";
@@ -108,15 +127,14 @@ export default function App() {
     [shop],
   );
   const persistentParams = useMemo(() => {
+    if (persistentSearch && persistentSearch.length > 0) {
+      return persistentSearch;
+    }
     const params = new URLSearchParams({ host, shop });
-    if (embedded) {
-      params.set("embedded", embedded);
-    }
-    if (sessionToken) {
-      params.set("session_token", sessionToken);
-    }
+    if (embedded) params.set("embedded", embedded);
+    if (sessionToken) params.set("session_token", sessionToken);
     return params.toString();
-  }, [embedded, host, sessionToken, shop]);
+  }, [embedded, host, persistentSearch, sessionToken, shop]);
 
   const handleNavigationToggle = useCallback(() => {
     setIsMobileNavActive((current) => !current);
@@ -170,7 +188,13 @@ export default function App() {
         onNavigationDismiss={handleNavigationDismiss}
       >
         <div id={skipToContentTarget} style={{ minHeight: "100%" }}>
-          <Outlet context={{ host, shop, persistentSearch: persistentParams }} />
+          <Outlet
+            context={{
+              host,
+              shop,
+              persistentSearch: persistentParams || null,
+            }}
+          />
         </div>
       </Frame>
     </AppProvider>

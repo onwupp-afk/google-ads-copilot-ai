@@ -62,7 +62,7 @@ export default function Dashboard() {
   );
 
   const buildEmbeddedUrl = (path: string) => {
-    return persistentSearch ? `${path}?${persistentSearch}` : path;
+    return persistentSearch && persistentSearch.length > 0 ? `${path}?${persistentSearch}` : path;
   };
 
   const scanRows = scanData.scans.map((scan) => {

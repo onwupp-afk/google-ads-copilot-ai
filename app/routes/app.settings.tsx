@@ -30,9 +30,8 @@ export default function Settings() {
   const [googleAdsConnected] = useState(true);
   const [shopifyMarketsConnected] = useState(true);
 
-  const buildEmbeddedUrl = (path: string) => {
-    return persistentSearch ? `${path}?${persistentSearch}` : path;
-  };
+  const buildEmbeddedUrl = (path: string) =>
+    persistentSearch && persistentSearch.length > 0 ? `${path}?${persistentSearch}` : path;
 
   return (
     <Page

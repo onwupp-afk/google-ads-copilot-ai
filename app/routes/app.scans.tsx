@@ -35,9 +35,8 @@ export default function Scans() {
     [],
   );
 
-  const buildEmbeddedUrl = (path: string) => {
-    return persistentSearch ? `${path}?${persistentSearch}` : path;
-  };
+  const buildEmbeddedUrl = (path: string) =>
+    persistentSearch && persistentSearch.length > 0 ? `${path}?${persistentSearch}` : path;
 
   const durations = ["3m 12s", "6m 08s", "4m 41s"];
 

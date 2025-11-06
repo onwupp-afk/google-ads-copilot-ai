@@ -34,9 +34,8 @@ export default function Audits() {
     [],
   );
 
-  const buildEmbeddedUrl = (path: string) => {
-    return persistentSearch ? `${path}?${persistentSearch}` : path;
-  };
+  const buildEmbeddedUrl = (path: string) =>
+    persistentSearch && persistentSearch.length > 0 ? `${path}?${persistentSearch}` : path;
 
   return (
     <Page
