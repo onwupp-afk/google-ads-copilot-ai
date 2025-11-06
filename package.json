@@ -37,7 +37,7 @@
     "@shopify/app-bridge-react": "^4.2.7",
     "@shopify/polaris": "^13.9.5",
     "@shopify/polaris-icons": "^9.3.1",
-    "@shopify/shopify-app-remix": "^3.7.0",
+    "@shopify/shopify-app-remix": "^3.8.5",
     "@shopify/shopify-app-session-storage-prisma": "^6.0.0",
     "clsx": "^2.1.1",
     "concurrently": "^9.0.0",

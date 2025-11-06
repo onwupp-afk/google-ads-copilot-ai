@@ -1,4 +1,9 @@
-import type { LinksFunction, MetaFunction } from "@remix-run/node";
+import type {
+  LinksFunction,
+  LoaderFunctionArgs,
+  MetaFunction,
+} from "@remix-run/node";
+import { json } from "@remix-run/node";
 import {
   Links,
   LiveReload,
@@ -6,18 +11,31 @@ import {
   Outlet,
   Scripts,
   ScrollRestoration,
+  useLoaderData,
 } from "@remix-run/react";
-import { AppProvider } from "@shopify/polaris";
+import { AppProvider as PolarisProvider } from "@shopify/polaris";
 import en from "@shopify/polaris/locales/en.json";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
+import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-remix/react";
 
-export const meta: MetaFunction = () => [{ title: "AIthor App" }];
+export const meta: MetaFunction = () => [
+  { title: "AIthor App" },
+  { name: "viewport", content: "width=device-width, initial-scale=1" },
+];
 
 export const links: LinksFunction = () => [
   { rel: "stylesheet", href: polarisStyles },
 ];
 
+export async function loader({ request }: LoaderFunctionArgs) {
+  return json({
+    apiKey: process.env.SHOPIFY_API_KEY,
+    embedded: true,
+  });
+}
+
 export default function Root() {
+  const { apiKey, embedded } = useLoaderData<typeof loader>();
   return (
     <html lang="en">
       <head>
@@ -25,9 +43,11 @@ export default function Root() {
         <Links />
       </head>
       <body>
-        <AppProvider i18n={en}>
-          <Outlet />
-        </AppProvider>
+        <ShopifyAppProvider apiKey={apiKey} isEmbeddedApp={embedded}>
+          <PolarisProvider i18n={en}>
+            <Outlet />
+          </PolarisProvider>
+        </ShopifyAppProvider>
         <ScrollRestoration />
         <Scripts />
         <LiveReload />
