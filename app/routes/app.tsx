@@ -99,9 +99,8 @@ export default function App() {
       <Navigation.Section
         items={[
           { label: "Dashboard", url: withParams("/app"), exactMatch: true },
-          { label: "Scans", url: withParams("/app/scans") },
+          { label: "Scan", url: withParams("/app/scans") },
           { label: "Settings", url: withParams("/app/settings") },
-          { label: "Support", url: "mailto:support@aithorapp.co.uk" },
         ]}
       />
     </Navigation>
