@@ -4,6 +4,7 @@ import { NavLink } from "@remix-run/react";
 export default function SidebarNav() {
   const items = [
     { to: "/app", label: "Home" },
+    { to: "/scan", label: "AI Compliance Scan" },
     { to: "/app/scans", label: "Scans" },
     { to: "/app/audits", label: "Audits" },
     { to: "/app/settings", label: "Settings" },
