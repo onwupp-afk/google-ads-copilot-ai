@@ -29,11 +29,10 @@ export const links: LinksFunction = () => [
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const url = new URL(request.url);
-  const hostParam = url.searchParams.get("host");
   return json({
     apiKey: process.env.SHOPIFY_API_KEY,
-    host: hostParam,
-    embedded: Boolean(hostParam),
+    host: url.searchParams.get("host"),
+    embedded: true,
   });
 }
 
@@ -46,11 +45,7 @@ export default function Root() {
         <Links />
       </head>
       <body>
-        <ShopifyAppProvider
-          apiKey={apiKey}
-          host={host ?? undefined}
-          isEmbeddedApp={embedded}
-        >
+        <ShopifyAppProvider apiKey={apiKey} host={host ?? undefined} isEmbeddedApp={embedded}>
           <PolarisProvider i18n={en}>
             <Outlet />
           </PolarisProvider>
