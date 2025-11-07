@@ -101,7 +101,7 @@ export default function App() {
           { label: "Dashboard", url: withParams("/app"), exactMatch: true },
           { label: "Scans", url: withParams("/app/scans") },
           { label: "Settings", url: withParams("/app/settings") },
-          { label: "Support", url: "mailto:support@aithorapp.co.uk" },
+          { label: "Support", url: withParams("/app/support") },
         ]}
       />
     </Navigation>
