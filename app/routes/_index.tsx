@@ -111,6 +111,14 @@ export default function Index() {
               <Text as="p" tone="subdued">
                 👋 Welcome back, {shopName}.
               </Text>
+              <InlineStack gap="200" blockAlign="center">
+                <Button url="/scan" primary>
+                  Go to AI Compliance Scan
+                </Button>
+                <Button url="/app" variant="plain">
+                  Open Embedded Dashboard
+                </Button>
+              </InlineStack>
             </Stack>
           </Card>
 
@@ -191,7 +199,7 @@ export default function Index() {
             <CalloutCard
               title="Run Your First Compliance Scan"
               illustration="https://cdn.shopify.com/shopifycloud/web/assets/v1/illustrations/marketing-email-list@3x.png"
-              primaryAction={{ content: "Start Scan", url: "/app/dashboard" }}
+              primaryAction={{ content: "Launch Scan Page", url: "/scan" }}
               secondaryAction={{ content: "View History", url: "/app/scans" }}
             >
               <Text as="p" tone="subdued">
