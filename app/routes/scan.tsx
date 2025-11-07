@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { LoaderFunctionArgs } from "@remix-run/node";
+import { json, redirect } from "@remix-run/node";
+import { useLoaderData } from "@remix-run/react";
 import { motion } from "framer-motion";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AppProvider as PolarisAppProvider,
   Badge,
   Banner,
   Button,
@@ -8,24 +12,30 @@ import {
   Card,
   DataTable,
   Divider,
+  Frame,
   Icon,
   InlineStack,
   Layout,
   LegacyStack as Stack,
   Link,
   Modal,
+  Navigation,
   Page,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
   Spinner,
   Text,
+  TopBar,
 } from "@shopify/polaris";
+import en from "@shopify/polaris/locales/en.json";
 import {
   AlertCircleIcon,
   CheckCircleIcon,
   ProductIcon,
 } from "@shopify/polaris-icons";
+import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-remix/react";
+import { authenticate } from "../shopify.server";
 
 const MARKETS = [
   { label: "United Kingdom", value: "uk" },
@@ -58,12 +68,12 @@ const MOCK_RESULTS = [
     market: "us",
     policyArea: "Restricted Content",
     issue: "CBD mention without FDA disclaimer.",
-    suggestion: "Add federally compliant disclaimer and remove medical guarantees.",
+    suggestion: "Add compliant disclaimer and remove medical guarantees.",
   },
   {
     id: "prod-3",
     product: "Thermal Compression Wrap",
-    market: "uk",
+    market: "de",
     policyArea: "Regulated Devices",
     issue: "Missing CE certification reference in listing.",
     suggestion: "Add CE compliance statement and usage disclaimer.",
@@ -71,10 +81,10 @@ const MOCK_RESULTS = [
   {
     id: "prod-4",
     product: "Organic Baby Formula",
-    market: "de",
+    market: "au",
     policyArea: "Local Law",
-    issue: "Advertising infant nutrition in ways prohibited by EU directive.",
-    suggestion: "Use approved EU wording and link to product origin certificate.",
+    issue: "Advertising infant nutrition with restricted phrasing.",
+    suggestion: "Use approved AU wording and link to origin certificate.",
   },
 ];
 
@@ -90,14 +100,46 @@ const motionVariants = {
   visible: { opacity: 1, y: 0 },
 };
 
+function buildLoginRedirect(url: URL) {
+  const shopParam =
+    url.searchParams.get("shop") ?? process.env.SHOP_DOMAIN ?? undefined;
+  if (shopParam) {
+    return redirect(`/auth/login?shop=${shopParam}`);
+  }
+  throw new Response("Missing shop parameter", { status: 400 });
+}
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const url = new URL(request.url);
+  const host = url.searchParams.get("host");
+
+  try {
+    const { session } = await authenticate.admin(request);
+    const shop = session?.shop;
+    if (!shop) {
+      return buildLoginRedirect(url);
+    }
+    return json({
+      apiKey: process.env.SHOPIFY_API_KEY || "",
+      host,
+      shop,
+      shopName: shop.replace(".myshopify.com", ""),
+    });
+  } catch (error) {
+    return buildLoginRedirect(url);
+  }
+}
+
 export default function ScanPage() {
+  const { apiKey, host, shop, shopName } = useLoaderData<typeof loader>();
   const [selectedMarket, setSelectedMarket] = useState(MARKETS[0].value);
   const [isScanning, setIsScanning] = useState(false);
-  const [showResults, setShowResults] = useState(false);
+  const [scanComplete, setScanComplete] = useState(false);
   const [scanTimestamp, setScanTimestamp] = useState<Date | null>(null);
   const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[0].value);
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => {
     return () => {
       if (timeoutRef.current) {
@@ -119,30 +161,30 @@ export default function ScanPage() {
 
   const handleMarketChange = useCallback((value: string) => {
     setSelectedMarket(value);
-    setShowResults(false);
+    setScanComplete(false);
     setScanTimestamp(null);
   }, []);
 
   const handleRunScan = useCallback(() => {
     if (isScanning) return;
     setIsScanning(true);
-    setShowResults(false);
+    setScanComplete(false);
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
     }
     timeoutRef.current = setTimeout(() => {
       setIsScanning(false);
-      setShowResults(true);
+      setScanComplete(true);
       setScanTimestamp(new Date());
     }, 2200);
   }, [isScanning]);
 
   const handleApplyFix = useCallback((id: string) => {
-    console.info("Applying AI fix for", id);
+    console.info("Applying AI fix", id);
   }, []);
 
   const handleEditAndApply = useCallback((id: string) => {
-    console.info("Opening edit drawer for", id);
+    console.info("Opening editor for", id);
   }, []);
 
   const handleApplyAll = useCallback(() => {
@@ -151,8 +193,26 @@ export default function ScanPage() {
 
   const closeUpgradeModal = useCallback(() => setShowUpgradeModal(false), []);
 
-  const scanDescription =
-    "This scan will review your product titles, descriptions, URLs, meta data, and theme content for any text, claims, or restricted terms that could trigger Google Ads or Merchant Center disapprovals in your selected market.";
+  const metricCards = [
+    {
+      title: "Products Scanned",
+      value: metrics.scanned.toLocaleString(),
+      description: "Items analyzed for Google Ads and local law compliance.",
+      icon: ProductIcon,
+    },
+    {
+      title: "Violations Detected",
+      value: metrics.violations.toLocaleString(),
+      description: "Detected potential issues in product listings.",
+      icon: AlertCircleIcon,
+    },
+    {
+      title: "Compliant Products",
+      value: `${metrics.compliance}%`,
+      description: "Currently approved and policy-aligned.",
+      icon: CheckCircleIcon,
+    },
+  ];
 
   const resultRows = filteredResults.map((result) => [
     result.product,
@@ -169,197 +229,214 @@ export default function ScanPage() {
     </InlineStack>,
   ]);
 
+  const navigationMarkup = (
+    <Navigation location="/scan">
+      <Navigation.Section
+        items={[
+          { label: "Dashboard", url: "/app" },
+          { label: "Scans", url: "/scan", selected: true },
+          { label: "Settings", url: "/app/settings" },
+          { label: "Support", url: "mailto:support@aithorapp.co.uk" },
+        ]}
+      />
+    </Navigation>
+  );
+
+  const topBarMarkup = (
+    <TopBar
+      contextControl={
+        <InlineStack gap="200" blockAlign="center">
+          <Text as="span" variant="headingSm">
+            {shop.replace(".myshopify.com", "")}
+          </Text>
+          <Badge tone="success">Connected</Badge>
+        </InlineStack>
+      }
+      secondaryMenu={<Button url="/app/settings">Upgrade</Button>}
+    />
+  );
+
+  const scanDescription =
+    "This scan reviews your product titles, descriptions, URLs, meta data, and theme content for restricted terms, misleading claims, or policy violations. It uses AI to analyze Google Ads and local law guidelines in real time.";
+
   return (
-    <Page title="AI Compliance Scan" subtitle="Scan your store’s products, URLs, descriptions, and theme content for violations of Google Ads policies and country-specific laws.">
-      <Layout>
-        <Layout.Section>
-          <Banner status="info" title="AI compliance engine">
-            Our AI is trained on the latest Google Ads and local market policies — updated automatically through OpenAI.
-          </Banner>
-        </Layout.Section>
+    <ShopifyAppProvider apiKey={apiKey} host={host ?? undefined} isEmbeddedApp>
+      <PolarisAppProvider i18n={en}>
+        <Frame navigation={navigationMarkup} topBar={topBarMarkup}>
+          <Page
+            title="AI Compliance Scan"
+            subtitle="Scan your Shopify store for Google Ads and regional policy violations — across product listings, descriptions, metadata, and theme content."
+          >
+            <Layout>
+              <Layout.Section>
+                <Banner status="info">
+                  This AI-powered scan uses OpenAI to stay up to date with the latest Google Ads and local law policies automatically.
+                </Banner>
+              </Layout.Section>
 
-        <Layout.Section>
-          <Card>
-            <Stack spacing="400">
-              <Select
-                label="Select Market to Scan"
-                options={MARKETS}
-                value={selectedMarket}
-                onChange={handleMarketChange}
-              />
-              <Text as="p" tone="subdued">
-                Choose a market to view localized compliance performance and run scoped scans.
-              </Text>
-            </Stack>
-          </Card>
-        </Layout.Section>
+              <Layout.Section>
+                <Divider />
+              </Layout.Section>
 
-        <Layout.Section>
-          <Layout>
-            {[
-              {
-                title: "Products Scanned",
-                value: metrics.scanned.toLocaleString(),
-                description: "Items analyzed for policy and legal compliance.",
-                icon: ProductIcon,
-              },
-              {
-                title: "Violations Detected",
-                value: metrics.violations.toLocaleString(),
-                description: "Detected disapprovals or potential issues.",
-                icon: AlertCircleIcon,
-              },
-              {
-                title: "Compliant Products",
-                value: `${metrics.compliance}%`,
-                description: "Currently approved and policy-aligned.",
-                icon: CheckCircleIcon,
-              },
-            ].map((metric, index) => (
-              <Layout.Section key={metric.title} variant="oneThird">
-                <motion.div
-                  variants={motionVariants}
-                  initial="hidden"
-                  animate="visible"
-                  transition={{ delay: 0.1 * index }}
-                >
+              <Layout.Section>
+                <Card>
+                  <Stack spacing="400">
+                    <Select
+                      label="Select Market to Scan"
+                      options={MARKETS}
+                      value={selectedMarket}
+                      onChange={handleMarketChange}
+                    />
+                    <Text as="p" tone="subdued">
+                      Scanning Google Ads policies and local laws for the selected market…
+                    </Text>
+                  </Stack>
+                </Card>
+              </Layout.Section>
+
+              <Layout.Section>
+                <Layout>
+                  {metricCards.map((metric, index) => (
+                    <Layout.Section key={metric.title} variant="oneThird">
+                      <motion.div
+                        variants={motionVariants}
+                        initial="hidden"
+                        animate="visible"
+                        transition={{ delay: 0.1 * index }}
+                      >
+                        <Card>
+                          <Stack spacing="400" alignment="center">
+                            <Icon source={metric.icon} tone="primary" />
+                            <div>
+                              <Text variant="headingMd" as="h3">
+                                {metric.title}
+                              </Text>
+                              <Text variant="headingLg" as="p">
+                                {metric.value}
+                              </Text>
+                              <Text as="p" tone="subdued">
+                                {metric.description}
+                              </Text>
+                            </div>
+                          </Stack>
+                        </Card>
+                      </motion.div>
+                    </Layout.Section>
+                  ))}
+                </Layout>
+              </Layout.Section>
+
+              <Layout.Section>
+                <Card title="Run New Scan" sectioned>
+                  <Text as="p" tone="subdued">
+                    {scanDescription}
+                  </Text>
+                  <InlineStack gap="300" blockAlign="center" style={{ marginTop: "var(--p-space-400)" }}>
+                    <Button onClick={handleRunScan} primary disabled={isScanning}>
+                      {isScanning ? (
+                        <InlineStack gap="200" blockAlign="center">
+                          <Spinner size="small" />
+                          <span>Scanning…</span>
+                        </InlineStack>
+                      ) : (
+                        "Run Scan Now"
+                      )}
+                    </Button>
+                    {scanTimestamp && !isScanning ? (
+                      <Text as="span" tone="subdued">
+                        Last scan: {scanTimestamp.toLocaleString()}
+                      </Text>
+                    ) : null}
+                  </InlineStack>
+                  {isScanning && (
+                    <div style={{ marginTop: "var(--p-space-400)" }}>
+                      <SkeletonDisplayText size="small" />
+                      <SkeletonBodyText lines={3} />
+                    </div>
+                  )}
+                </Card>
+              </Layout.Section>
+
+              <Layout.Section>
+                <Card title="About Our AI Engine" sectioned>
+                  <Stack spacing="400">
+                    <Text as="p">
+                      Powered by OpenAI, our system continuously checks Google Ads and regional law sources to ensure your compliance checks are always current.
+                    </Text>
+                    <InlineStack gap="200">
+                      <Badge tone="info">GPT-5 Intelligence</Badge>
+                      <Badge tone="success">Auto-updating</Badge>
+                      <Badge tone="attention">Law Synced</Badge>
+                    </InlineStack>
+                  </Stack>
+                </Card>
+              </Layout.Section>
+
+              {scanComplete && (
+                <Layout.Section>
                   <Card>
-                    <Stack spacing="400" alignment="center">
-                      <Icon source={metric.icon} tone="primary" />
+                    <Stack spacing="400">
                       <div>
-                        <Text variant="headingMd" as="h3">
-                          {metric.title}
-                        </Text>
-                        <Text variant="headingLg" as="p">
-                          {metric.value}
+                        <Text variant="headingLg" as="h2">
+                          Scan Results
                         </Text>
                         <Text as="p" tone="subdued">
-                          {metric.description}
+                          Review flagged products and apply AI powered fixes instantly.
                         </Text>
                       </div>
+                      <Divider />
+                      <InlineStack align="space-between" blockAlign="center">
+                        <InlineStack gap="200" blockAlign="center">
+                          <Button onClick={handleApplyAll}>Apply All AI Suggestions</Button>
+                          <Text as="span" tone="subdued">
+                            Upgrade required for automatic remediation.
+                          </Text>
+                        </InlineStack>
+                        <Select
+                          labelHidden
+                          label="Rows per page"
+                          options={PAGE_SIZE_OPTIONS}
+                          value={pageSize}
+                          onChange={setPageSize}
+                        />
+                      </InlineStack>
+                      <DataTable
+                        columnContentTypes={["text", "text", "text", "text", "text"]}
+                        headings={["Product", "Policy Area", "Issue", "AI Suggestion", "Actions"]}
+                        rows={resultRows}
+                      />
+                      <Text as="span" tone="subdued">
+                        Showing {filteredResults.length} of {filteredResults.length} results for this market.
+                      </Text>
                     </Stack>
                   </Card>
-                </motion.div>
-              </Layout.Section>
-            ))}
-          </Layout>
-        </Layout.Section>
+                </Layout.Section>
+              )}
+            </Layout>
+          </Page>
 
-        <Layout.Section>
-          <Card title="Run New Scan" sectioned>
-            <Text as="p" tone="subdued">
-              {scanDescription}
-            </Text>
-            <InlineStack gap="300" align="start" blockAlign="center" style={{ marginTop: "var(--p-space-400)" }}>
-              <Button onClick={handleRunScan} primary disabled={isScanning} tone="success">
-                {isScanning ? (
-                  <InlineStack gap="200" blockAlign="center">
-                    <Spinner size="small" />
-                    <span>Scanning…</span>
-                  </InlineStack>
-                ) : (
-                  "Run Scan Now"
-                )}
-              </Button>
-              {scanTimestamp && !isScanning ? (
-                <Text as="span" tone="subdued">
-                  Last scan: {scanTimestamp.toLocaleString()}
-                </Text>
-              ) : null}
-            </InlineStack>
-            {isScanning && (
-              <div style={{ marginTop: "var(--p-space-400)" }}>
-                <SkeletonDisplayText size="small" />
-                <SkeletonBodyText lines={3} />
-              </div>
-            )}
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section>
-          <Card title="About Our AI Engine" sectioned>
-            <Stack spacing="400">
-              <Text as="p">
-                Our OpenAI-powered system continuously checks Google Ads and legal policy documentation in real time, ensuring your scans stay up to date.
-              </Text>
-              <InlineStack gap="200">
-                <Badge tone="success">Auto-updating</Badge>
-                <Badge tone="info">GPT-5 Intelligence</Badge>
-                <Badge tone="attention">Legal Source Verified</Badge>
-              </InlineStack>
+          <Modal
+            open={showUpgradeModal}
+            onClose={closeUpgradeModal}
+            title="Upgrade your plan to automatically apply AI compliance fixes"
+            primaryAction={{
+              content: "Upgrade Plan",
+              onAction: () => {
+                console.info("Upgrade flow");
+                closeUpgradeModal();
+              },
+            }}
+            secondaryActions={[{ content: "Not now", onAction: closeUpgradeModal }]}
+          >
+            <Modal.Section>
               <Text as="p" tone="subdued">
-                API integrations and policy feeds refresh every few hours so your compliance posture is always current.
+                Unlock 1-click remediation, historical scanning, and legal export packs with our Growth and Agency plans.
               </Text>
-            </Stack>
-          </Card>
-        </Layout.Section>
-
-        {showResults && (
-          <Layout.Section>
-            <Card>
-              <Stack spacing="400">
-                <div>
-                  <Text variant="headingLg" as="h2">
-                    Scan Results
-                  </Text>
-                  <Text as="p" tone="subdued">
-                    Review AI summaries for flagged items. Apply fixes instantly or edit before publishing.
-                  </Text>
-                </div>
-                <Divider />
-                <InlineStack align="space-between" blockAlign="center">
-                  <InlineStack gap="200" blockAlign="center">
-                    <Button onClick={handleApplyAll}>
-                      Apply All AI Suggestions
-                    </Button>
-                    <Text as="span" tone="subdued">
-                      Upgrade required for 1-click remediation.
-                    </Text>
-                  </InlineStack>
-                  <Select
-                    labelHidden
-                    label="Rows per page"
-                    options={PAGE_SIZE_OPTIONS}
-                    value={pageSize}
-                    onChange={setPageSize}
-                  />
-                </InlineStack>
-                <DataTable
-                  columnContentTypes={["text", "text", "text", "text", "text"]}
-                  headings={["Product", "Policy Area", "Issue", "AI Suggestion", "Actions"]}
-                  rows={resultRows}
-                />
-                <Text as="span" tone="subdued">
-                  Showing {Math.min(filteredResults.length, Number(pageSize))} of {filteredResults.length} results for this market.
-                </Text>
-              </Stack>
-            </Card>
-          </Layout.Section>
-        )}
-      </Layout>
-
-      <Modal
-        open={showUpgradeModal}
-        onClose={closeUpgradeModal}
-        title="Upgrade to apply AI compliance patches automatically"
-        primaryAction={{
-          content: "Upgrade Plan",
-          onAction: () => {
-            console.info("Redirecting to upgrade flow");
-            closeUpgradeModal();
-          },
-        }}
-        secondaryActions={[{ content: "Not now", onAction: closeUpgradeModal }]}
-      >
-        <Modal.Section>
-          <Text as="p" tone="subdued">
-            Batch remediation is available on the Growth and Agency plans. Unlock automatic AI fixes, historical reporting, and policy exports for every market you sell in.
-          </Text>
-          <Link url="mailto:sales@aithorapp.co.uk" tone="success">
-            Talk to compliance support
-          </Link>
-        </Modal.Section>
-      </Modal>
-    </Page>
+              <Link url="mailto:sales@aithorapp.co.uk">Talk to compliance support</Link>
+            </Modal.Section>
+          </Modal>
+        </Frame>
+      </PolarisAppProvider>
+    </ShopifyAppProvider>
   );
 }
