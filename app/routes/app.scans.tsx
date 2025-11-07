@@ -62,6 +62,12 @@ const PRODUCT_UPDATE_MUTATION = `#graphql
   }
 `;
 
+export type PhraseSuggestion = {
+  original: string;
+  replacement: string;
+  reason: string;
+};
+
 export type ComplianceFinding = {
   productId: string;
   legacyResourceId?: string;
@@ -70,8 +76,7 @@ export type ComplianceFinding = {
   matchedKeywords: string[];
   issues: string[];
   policyArea: string;
-  suggestion: string;
-  aiSummary?: string;
+  phrases: PhraseSuggestion[];
   complianceScore: number;
   status: "flagged" | "clean";
 };
@@ -98,21 +103,46 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
   const market = (formData.get("market")?.toString() ?? "uk").toLowerCase();
-  const suggestion = formData.get("suggestion")?.toString();
   const productId = formData.get("productId")?.toString();
+  const phrasesPayload = formData.get("phrases")?.toString();
 
   const { admin, session } = await authenticate.admin(request);
 
   if (intent === "applySuggestion") {
-    if (!productId || !suggestion) {
-      return json({ error: "Missing product or suggestion" }, { status: 400 });
+    if (!productId || !phrasesPayload) {
+      return json({ error: "Missing product or suggestions" }, { status: 400 });
     }
+
+    let phrases: PhraseSuggestion[] = [];
+    try {
+      phrases = JSON.parse(phrasesPayload) as PhraseSuggestion[];
+    } catch {
+      return json({ error: "Invalid suggestion payload" }, { status: 400 });
+    }
+
+    if (!phrases.length) {
+      return json({ error: "No suggestions to apply" }, { status: 400 });
+    }
+
+    const descriptionResponse = await admin.graphql(
+      `#graphql
+        query ProductDescription($id: ID!) {
+          product(id: $id) {
+            descriptionHtml
+          }
+        }
+      `,
+      { variables: { id: productId } },
+    );
+    const descriptionBody = await descriptionResponse.json();
+    const currentHtml = descriptionBody?.data?.product?.descriptionHtml ?? "";
+    const updatedHtml = applyPhraseSuggestions(currentHtml, phrases);
 
     const response = await admin.graphql(PRODUCT_UPDATE_MUTATION, {
       variables: {
         input: {
           id: productId,
-          descriptionHtml: wrapSuggestionHtml(suggestion),
+          descriptionHtml: updatedHtml,
         },
       },
     });
@@ -141,7 +171,7 @@ export default function AppScansPage() {
   const [selectedScanId, setSelectedScanId] = useState<string | null>(scans[0]?.id ?? null);
   const [market, setMarket] = useState<string>("uk");
   const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
-  const [suggestionDrafts, setSuggestionDrafts] = useState<Record<string, string>>({});
+  const [phraseDrafts, setPhraseDrafts] = useState<Record<string, PhraseSuggestion[]>>({});
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   useEffect(() => {
@@ -168,11 +198,11 @@ export default function AppScansPage() {
 
   useEffect(() => {
     if (displayedScan) {
-      const drafts: Record<string, string> = {};
+      const drafts: Record<string, PhraseSuggestion[]> = {};
       displayedScan.results.forEach((result) => {
-        drafts[result.productId] = result.suggestion;
+        drafts[result.productId] = result.phrases ?? [];
       });
-      setSuggestionDrafts(drafts);
+      setPhraseDrafts(drafts);
     }
   }, [displayedScan?.id]);
 
@@ -195,6 +225,15 @@ export default function AppScansPage() {
       }
     : null;
 
+  const handleReplacementChange = (productId: string, phraseIndex: number, value: string) => {
+    setPhraseDrafts((prev) => {
+      const existing = prev[productId] ? [...prev[productId]] : [];
+      if (!existing[phraseIndex]) return prev;
+      existing[phraseIndex] = { ...existing[phraseIndex], replacement: value };
+      return { ...prev, [productId]: existing };
+    });
+  };
+
   const rows = (displayedScan?.results ?? []).map((result) => [
     <Text key={`${result.productId}-title`} variant="bodyMd">{result.productTitle}</Text>,
     <div key={`${result.productId}-issues`}>
@@ -210,30 +249,45 @@ export default function AppScansPage() {
         </Stack>
       )}
     </div>,
-    <TextField
-      key={`${result.productId}-suggestion`}
-      value={suggestionDrafts[result.productId] ?? result.suggestion}
-      onChange={(value) =>
-        setSuggestionDrafts((prev) => ({
-          ...prev,
-          [result.productId]: value,
-        }))
-      }
-      multiline
-    />,
+    <div key={`${result.productId}-phrases`}>
+      {(phraseDrafts[result.productId] ?? []).length === 0 ? (
+        <Text tone="subdued">No problematic phrases detected.</Text>
+      ) : (
+        phraseDrafts[result.productId].map((phrase, index) => (
+          <div key={`${result.productId}-phrase-${index}`} style={{ marginBottom: "var(--p-space-300)" }}>
+            <Text variant="bodySm" tone="critical">
+              Flagged: {phrase.original || "(phrase not found)"}
+            </Text>
+            <TextField
+              labelHidden
+              label={`Replacement ${index + 1}`}
+              value={phrase.replacement}
+              onChange={(value) => handleReplacementChange(result.productId, index, value)}
+              multiline
+            />
+            <Text variant="bodySm" tone="subdued">
+              {phrase.reason}
+            </Text>
+          </div>
+        ))
+      )}
+    </div>,
     <InlineStack key={`${result.productId}-actions`} gap="200" blockAlign="center">
       <applyFetcher.Form method="post">
         <input type="hidden" name="intent" value="applySuggestion" />
         <input type="hidden" name="productId" value={result.productId} />
         <input
           type="hidden"
-          name="suggestion"
-          value={suggestionDrafts[result.productId] ?? result.suggestion}
+          name="phrases"
+          value={JSON.stringify(phraseDrafts[result.productId] ?? [])}
         />
         <Button
           size="slim"
           submit
-          disabled={applyFetcher.state !== "idle" && applyingProductId === result.productId}
+          disabled={
+            (phraseDrafts[result.productId] ?? []).length === 0 ||
+            (applyFetcher.state !== "idle" && applyingProductId === result.productId)
+          }
         >
           {applyingProductId === result.productId && applyFetcher.state !== "idle" ? (
             <InlineStack gap="100" blockAlign="center">
@@ -455,12 +509,6 @@ function formatTimestamp(value: string) {
   return new Date(value).toLocaleString();
 }
 
-function wrapSuggestionHtml(text: string) {
-  const normalized = text.trim();
-  if (!normalized) return "";
-  return normalized.startsWith("<") ? normalized : `<p>${normalized}</p>`;
-}
-
 function serializeScan(scan: Scan): SerializedScan {
   return {
     ...scan,
@@ -468,6 +516,19 @@ function serializeScan(scan: Scan): SerializedScan {
     completedAt: scan.completedAt ? scan.completedAt.toISOString() : null,
     results: (scan.results as ComplianceFinding[] | null) ?? [],
   };
+}
+
+function applyPhraseSuggestions(html: string, phrases: PhraseSuggestion[]) {
+  if (!phrases.length) return html;
+  return phrases.reduce((acc, phrase) => {
+    if (!phrase.original || !phrase.replacement) return acc;
+    const regex = new RegExp(escapeRegExp(phrase.original), "gi");
+    return acc.replace(regex, phrase.replacement);
+  }, html);
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function runComplianceScan({ admin, session, market }: any) {
@@ -531,19 +592,23 @@ async function analyzeProduct({
   const severityScore = matches.reduce((sum, match) => sum + (match.rule.severity === "high" ? 30 : match.rule.severity === "medium" ? 15 : 5), 0);
   const complianceScore = Math.max(0, 100 - severityScore);
   const status: "flagged" | "clean" = issues.length ? "flagged" : "clean";
-  const fallbackSuggestion = issues.length
-    ? `Rewrite copy to remove: ${matches.map((m) => m.matchingWords.join(", ")).join("; ")}`
-    : "No changes required. Product looks compliant.";
+  const fallbackSuggestions: PhraseSuggestion[] = matches.length
+    ? matches.map((match) => ({
+        original: match.matchingWords[0] ?? "",
+        replacement: `Replace "${match.matchingWords[0]}" with compliant phrasing`,
+        reason: match.rule.description,
+      }))
+    : [];
 
-  const suggestion = issues.length
-    ? await buildAiSuggestion({
+  const phraseSuggestions = matches.length
+    ? await buildAiSuggestions({
         openAiClient,
         market,
         productTitle: product.title,
         description: plainDescription,
-        fallback: fallbackSuggestion,
+        fallback: fallbackSuggestions,
       })
-    : fallbackSuggestion;
+    : [];
 
   return {
     productId: product.id,
@@ -553,8 +618,7 @@ async function analyzeProduct({
     matchedKeywords: matches.flatMap((match) => match.matchingWords),
     issues,
     policyArea: matches.map((m) => m.rule.category).join(", ") || "None",
-    suggestion,
-    aiSummary: suggestion,
+    phrases: phraseSuggestions,
     complianceScore,
     status,
   };
@@ -569,7 +633,7 @@ function detectPolicyMatches(text: string, rules: PolicyRule[]) {
     .filter(Boolean) as { rule: PolicyRule; matchingWords: string[] }[];
 }
 
-async function buildAiSuggestion({
+async function buildAiSuggestions({
   openAiClient,
   market,
   productTitle,
@@ -580,29 +644,37 @@ async function buildAiSuggestion({
   market: string;
   productTitle: string;
   description: string;
-  fallback: string;
-}) {
+  fallback: PhraseSuggestion[];
+}): Promise<PhraseSuggestion[]> {
   if (!openAiClient) return fallback;
 
   try {
     const completion = await openAiClient.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
+      response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
           content:
-            "You are a Google Ads and local law compliance reviewer. Suggest concise, policy-safe product description text (max 80 words).",
+            "You are a Google Ads and local law compliance reviewer. Identify risky phrases and offer compliant replacements. Limit replacements to short snippets (max 15 words).",
         },
         {
           role: "user",
-          content: `Market: ${market.toUpperCase()}\nProduct: ${productTitle}\nDescription: ${description}\nRewrite this description so that it follows Google Ads and local laws.`,
+          content: `Market: ${market.toUpperCase()}\nProduct: ${productTitle}\nDescription: ${description}\nReturn JSON {"phrases": [{"original":"", "replacement":"", "reason":""}, ...]}. Only include phrases that actually appear in the text.`,
         },
       ],
     });
-    return completion.choices?.[0]?.message?.content?.trim() ?? fallback;
+
+    const content = completion.choices?.[0]?.message?.content;
+    if (!content) return fallback;
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed.phrases)) {
+      return parsed.phrases.filter((phrase: any) => phrase?.original && phrase?.replacement);
+    }
+    return fallback;
   } catch (error) {
-    console.error("OpenAI suggestion failed", error);
+    console.error("OpenAI phrase generation failed", error);
     return fallback;
   }
 }
