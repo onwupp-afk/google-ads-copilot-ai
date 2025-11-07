@@ -28,6 +28,7 @@ import { AlertCircleIcon, CheckCircleIcon, ProductIcon } from "@shopify/polaris-
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getPolicyRules, type PolicyRule } from "../data/policyKeywords";
+import { openai, testConnection } from "../utils/openai.server";
 
 const RESULTS_PER_PAGE = 25;
 
@@ -97,13 +98,16 @@ export type SerializedScan = Omit<Scan, "startedAt" | "completedAt" | "results">
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
 
-  const scans = await prisma.scan.findMany({
-    where: { shopDomain: session.shop },
-    orderBy: { startedAt: "desc" },
-    take: 5,
-  });
+  const [scans, aiStatus] = await Promise.all([
+    prisma.scan.findMany({
+      where: { shopDomain: session.shop },
+      orderBy: { startedAt: "desc" },
+      take: 5,
+    }),
+    testConnection(),
+  ]);
 
-  return json({ scans: scans.map(serializeScan) });
+  return json({ scans: scans.map(serializeScan), aiConnected: Boolean(aiStatus) });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -162,15 +166,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (intent === "startScan") {
-    const scan = await runComplianceScan({ admin, session, market });
-    return json({ scan: serializeScan(scan) });
+    try {
+      const scan = await runComplianceScan({ admin, session, market });
+      return json({ scan: serializeScan(scan) });
+    } catch (error) {
+      console.error("AI scan failed", error);
+      return json(
+        { error: error instanceof Error ? error.message : "Scan failed" },
+        { status: 500 },
+      );
+    }
   }
 
   return json({ error: "Unsupported action" }, { status: 400 });
 };
 
 export default function AppScansPage() {
-  const { scans } = useLoaderData<typeof loader>();
+  const { scans, aiConnected } = useLoaderData<typeof loader>();
   const runScanFetcher = useFetcher<typeof action>();
   const applyFetcher = useFetcher<typeof action>();
 
@@ -180,13 +192,19 @@ export default function AppScansPage() {
   const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
   const [phraseDrafts, setPhraseDrafts] = useState<Record<string, PhraseSuggestion[]>>({});
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
 
   useEffect(() => {
-    if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
-      setHistory((prev) => [runScanFetcher.data.scan, ...prev].slice(0, 5));
-      setSelectedScanId(runScanFetcher.data.scan.id);
-      setCurrentPage(0);
+    if (runScanFetcher.state === "idle") {
+      if (runScanFetcher.data?.scan) {
+        setHistory((prev) => [runScanFetcher.data.scan, ...prev].slice(0, 5));
+        setSelectedScanId(runScanFetcher.data.scan.id);
+        setCurrentPage(0);
+        setScanError(null);
+      } else if (runScanFetcher.data?.error) {
+        setScanError(runScanFetcher.data.error as string);
+      }
     }
   }, [runScanFetcher.state, runScanFetcher.data]);
 
@@ -369,10 +387,18 @@ export default function AppScansPage() {
           </Card>
         </Layout.Section>
 
-        <Layout.Section>
-          <Layout>
-            {getMetricCards(metrics).map((metric, index) => (
-              <Layout.Section key={metric.title} variant="oneThird">
+      <Layout.Section>
+        {!aiConnected && (
+          <Banner status="critical" title="AI connection failed">
+            <p>We couldn’t connect to OpenAI. Please check your API key or try again later.</p>
+          </Banner>
+        )}
+      </Layout.Section>
+
+      <Layout.Section>
+        <Layout>
+          {getMetricCards(metrics).map((metric, index) => (
+            <Layout.Section key={metric.title} variant="oneThird">
                 <Card>
                   <Stack spacing="300" alignment="center">
                     <Icon source={metric.icon} tone="primary" />
@@ -434,6 +460,14 @@ export default function AppScansPage() {
           <Layout.Section>
             <Banner status="success" onDismiss={() => setStatusMessage(null)}>
               {statusMessage}
+            </Banner>
+          </Layout.Section>
+        )}
+
+        {scanError && (
+          <Layout.Section>
+            <Banner status="critical" onDismiss={() => setScanError(null)}>
+              {scanError}
             </Banner>
           </Layout.Section>
         )}
@@ -545,11 +579,14 @@ function escapeRegExp(value: string) {
 
 async function runComplianceScan({ admin, session, market }: any) {
   const products = await fetchAllProducts(admin);
+  if (!products.length) {
+    throw new Error("No products found to scan.");
+  }
   const rules = getPolicyRules(market);
-
-  const openAiClient = process.env.OPENAI_API_KEY
-    ? new (await import("openai")).default({ apiKey: process.env.OPENAI_API_KEY })
-    : null;
+  const openAiClient = openai;
+  if (!openAiClient) {
+    throw new Error("OpenAI API key missing. Add OPENAI_API_KEY to the environment.");
+  }
 
   const results: ComplianceFinding[] = [];
 
