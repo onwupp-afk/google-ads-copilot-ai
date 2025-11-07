@@ -16,6 +16,7 @@ import {
   LegacyStack as Stack,
   Link,
   Modal,
+  Pagination,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
@@ -28,9 +29,11 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getPolicyRules, type PolicyRule } from "../data/policyKeywords";
 
+const RESULTS_PER_PAGE = 25;
+
 const PRODUCTS_QUERY = `#graphql
-  query ScanProducts($first: Int!) {
-    products(first: $first, sortKey: UPDATED_AT) {
+  query ScanProducts($first: Int!, $after: String) {
+    products(first: $first, after: $after, sortKey: UPDATED_AT) {
       nodes {
         id
         legacyResourceId
@@ -48,6 +51,10 @@ const PRODUCTS_QUERY = `#graphql
             }
           }
         }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
       }
     }
   }
@@ -173,11 +180,13 @@ export default function AppScansPage() {
   const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
   const [phraseDrafts, setPhraseDrafts] = useState<Record<string, PhraseSuggestion[]>>({});
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(0);
 
   useEffect(() => {
     if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
       setHistory((prev) => [runScanFetcher.data.scan, ...prev].slice(0, 5));
       setSelectedScanId(runScanFetcher.data.scan.id);
+      setCurrentPage(0);
     }
   }, [runScanFetcher.state, runScanFetcher.data]);
 
@@ -203,6 +212,7 @@ export default function AppScansPage() {
         drafts[result.productId] = result.phrases ?? [];
       });
       setPhraseDrafts(drafts);
+      setCurrentPage(0);
     }
   }, [displayedScan?.id]);
 
@@ -225,6 +235,14 @@ export default function AppScansPage() {
       }
     : null;
 
+  const totalPages = displayedScan ? Math.max(1, Math.ceil(displayedScan.results.length / RESULTS_PER_PAGE)) : 1;
+
+  const visibleResults = useMemo(() => {
+    if (!displayedScan) return [];
+    const start = currentPage * RESULTS_PER_PAGE;
+    return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
+  }, [displayedScan, currentPage]);
+
   const handleReplacementChange = (productId: string, phraseIndex: number, value: string) => {
     setPhraseDrafts((prev) => {
       const existing = prev[productId] ? [...prev[productId]] : [];
@@ -234,7 +252,7 @@ export default function AppScansPage() {
     });
   };
 
-  const rows = (displayedScan?.results ?? []).map((result) => [
+  const rows = visibleResults.map((result) => [
     <Text key={`${result.productId}-title`} variant="bodyMd">{result.productTitle}</Text>,
     <div key={`${result.productId}-issues`}>
       {result.issues.length === 0 ? (
@@ -340,7 +358,10 @@ export default function AppScansPage() {
                   label="Scan history"
                   options={scanHistoryOptions}
                   value={selectedScanId ?? undefined}
-                  onChange={(value) => setSelectedScanId(value)}
+                  onChange={(value) => {
+                    setSelectedScanId(value);
+                    setCurrentPage(0);
+                  }}
                   placeholder="Most recent"
                 />
               )}
@@ -437,14 +458,19 @@ export default function AppScansPage() {
                       Upgrade required for automatic remediation.
                     </Text>
                   </InlineStack>
-                  <Select
-                    labelHidden
-                    label="Rows per page"
-                    options={PAGE_SIZE_OPTIONS}
-                    value={pageSizeFromResults(displayedScan.results)}
-                    onChange={() => {}}
-                    disabled
-                  />
+                  {displayedScan.results.length > RESULTS_PER_PAGE && (
+                    <InlineStack gap="200" blockAlign="center">
+                      <Pagination
+                        hasPrevious={currentPage > 0}
+                        onPrevious={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
+                        hasNext={currentPage < totalPages - 1}
+                        onNext={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
+                      />
+                      <Text tone="subdued">
+                        Page {currentPage + 1} of {totalPages}
+                      </Text>
+                    </InlineStack>
+                  )}
                 </InlineStack>
                 <DataTable
                   columnContentTypes={["text", "text", "text", "text"]}
@@ -491,20 +517,6 @@ const MARKETS = [
   { label: "Canada", value: "ca" },
 ];
 
-const PAGE_SIZE_OPTIONS = [
-  { label: "10 rows", value: "10" },
-  { label: "25 rows", value: "25" },
-  { label: "50 rows", value: "50" },
-  { label: "100 rows", value: "100" },
-];
-
-function pageSizeFromResults(results: ComplianceFinding[]) {
-  if (results.length <= 10) return "10";
-  if (results.length <= 25) return "25";
-  if (results.length <= 50) return "50";
-  return "100";
-}
-
 function formatTimestamp(value: string) {
   return new Date(value).toLocaleString();
 }
@@ -532,9 +544,7 @@ function escapeRegExp(value: string) {
 }
 
 async function runComplianceScan({ admin, session, market }: any) {
-  const response = await admin.graphql(PRODUCTS_QUERY, { variables: { first: 5 } });
-  const body = await response.json();
-  const products = body?.data?.products?.nodes ?? [];
+  const products = await fetchAllProducts(admin);
   const rules = getPolicyRules(market);
 
   const openAiClient = process.env.OPENAI_API_KEY
@@ -567,6 +577,25 @@ async function runComplianceScan({ admin, session, market }: any) {
   });
 
   return saved;
+}
+
+async function fetchAllProducts(admin: any, batchSize = 50) {
+  const products: any[] = [];
+  let after: string | null = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const response = await admin.graphql(PRODUCTS_QUERY, { variables: { first: batchSize, after } });
+    const body = await response.json();
+    const nodes = body?.data?.products?.nodes ?? [];
+    products.push(...nodes);
+    const pageInfo = body?.data?.products?.pageInfo;
+    hasNextPage = Boolean(pageInfo?.hasNextPage);
+    after = pageInfo?.endCursor ?? null;
+    if (!hasNextPage) break;
+  }
+
+  return products;
 }
 
 async function analyzeProduct({
