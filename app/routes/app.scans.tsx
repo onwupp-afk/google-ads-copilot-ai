@@ -1,6 +1,8 @@
-import { motion } from "framer-motion";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useOutletContext } from "@remix-run/react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
+import { json } from "@remix-run/node";
+import { useEffect, useMemo, useState } from "react";
+import { useFetcher, useLoaderData } from "@remix-run/react";
+import type { Scan } from "@prisma/client";
 import {
   Badge,
   Banner,
@@ -21,147 +23,228 @@ import {
   Text,
   TextField,
 } from "@shopify/polaris";
-import {
-  AlertCircleIcon,
-  CheckCircleIcon,
-  ProductIcon,
-} from "@shopify/polaris-icons";
-import type { AppContext } from "./app";
+import { AlertCircleIcon, CheckCircleIcon, ProductIcon } from "@shopify/polaris-icons";
+import prisma from "../db.server";
+import { authenticate } from "../shopify.server";
+import { getPolicyRules, type PolicyRule } from "../data/policyKeywords";
 
-const MARKETS = [
-  { label: "United Kingdom", value: "uk" },
-  { label: "United States", value: "us" },
-  { label: "European Union", value: "eu" },
-  { label: "Australia", value: "au" },
-  { label: "Canada", value: "ca" },
-];
+const PRODUCTS_QUERY = `#graphql
+  query ScanProducts($first: Int!) {
+    products(first: $first, sortKey: UPDATED_AT) {
+      nodes {
+        id
+        legacyResourceId
+        title
+        handle
+        descriptionHtml
+        onlineStoreUrl
+        tags
+        metafields(first: 10) {
+          edges {
+            node {
+              namespace
+              key
+              value
+            }
+          }
+        }
+      }
+    }
+  }
+`;
 
-const MARKET_METRICS: Record<string, { scanned: number; issues: number; fixes: number }> = {
-  uk: { scanned: 1248, issues: 23, fixes: 17 },
-  us: { scanned: 2134, issues: 41, fixes: 36 },
-  eu: { scanned: 980, issues: 12, fixes: 10 },
-  au: { scanned: 642, issues: 9, fixes: 8 },
-  ca: { scanned: 870, issues: 18, fixes: 16 },
+const PRODUCT_UPDATE_MUTATION = `#graphql
+  mutation UpdateProduct($input: ProductInput!) {
+    productUpdate(input: $input) {
+      product { id }
+      userErrors { field message }
+    }
+  }
+`;
+
+export type ComplianceFinding = {
+  productId: string;
+  legacyResourceId?: string;
+  productTitle: string;
+  market: string;
+  matchedKeywords: string[];
+  issues: string[];
+  policyArea: string;
+  suggestion: string;
+  aiSummary?: string;
+  complianceScore: number;
+  status: "flagged" | "clean";
 };
 
-const MOCK_FINDINGS = [
-  {
-    id: "prod-1",
-    market: "uk",
-    title: "CBD Night Drops",
-    issue: "Medical claims flagged for restricted content.",
-    policy: "Restricted Content",
-    suggestion: "Replace medical promises with general wellness messaging.",
-  },
-  {
-    id: "prod-2",
-    market: "us",
-    title: "Organic Baby Formula",
-    issue: "Missing FDA compliant disclaimer for infant nutrition.",
-    policy: "Medical Claims",
-    suggestion: "Add required disclaimer and remove cure language.",
-  },
-  {
-    id: "prod-3",
-    market: "eu",
-    title: "Thermal Compression Wrap",
-    issue: "CE certification reference missing from description.",
-    policy: "Regulated Device",
-    suggestion: "Include CE ID and approved usage statement.",
-  },
-  {
-    id: "prod-4",
-    market: "au",
-    title: "Herbal Health Booster",
-    issue: "Contains wording banned by TGA advertising code.",
-    policy: "Local Law",
-    suggestion: "Swap to approved AU phrasing and cite source.",
-  },
-];
+export type SerializedScan = Omit<Scan, "startedAt" | "completedAt" | "results"> & {
+  startedAt: string;
+  completedAt: string | null;
+  results: ComplianceFinding[];
+};
 
-const PAGE_SIZE_OPTIONS = [
-  { label: "10 rows", value: "10" },
-  { label: "25 rows", value: "25" },
-  { label: "50 rows", value: "50" },
-  { label: "100 rows", value: "100" },
-];
+export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
 
-const metricVariants = {
-  hidden: { opacity: 0, y: 8 },
-  visible: { opacity: 1, y: 0 },
+  const scans = await prisma.scan.findMany({
+    where: { shopDomain: session.shop },
+    orderBy: { startedAt: "desc" },
+    take: 5,
+  });
+
+  return json({ scans: scans.map(serializeScan) });
+};
+
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+  const market = (formData.get("market")?.toString() ?? "uk").toLowerCase();
+  const suggestion = formData.get("suggestion")?.toString();
+  const productId = formData.get("productId")?.toString();
+
+  const { admin, session } = await authenticate.admin(request);
+
+  if (intent === "applySuggestion") {
+    if (!productId || !suggestion) {
+      return json({ error: "Missing product or suggestion" }, { status: 400 });
+    }
+
+    const response = await admin.graphql(PRODUCT_UPDATE_MUTATION, {
+      variables: {
+        input: {
+          id: productId,
+          descriptionHtml: wrapSuggestionHtml(suggestion),
+        },
+      },
+    });
+    const body = await response.json();
+    const errors = body?.data?.productUpdate?.userErrors;
+    if (errors?.length) {
+      return json({ error: errors[0].message }, { status: 400 });
+    }
+    return json({ applied: true });
+  }
+
+  if (intent === "startScan") {
+    const scan = await runComplianceScan({ admin, session, market });
+    return json({ scan: serializeScan(scan) });
+  }
+
+  return json({ error: "Unsupported action" }, { status: 400 });
 };
 
 export default function AppScansPage() {
-  const { shop } = useOutletContext<AppContext>();
-  const shopName = shop.replace(".myshopify.com", "");
-  const [selectedMarket, setSelectedMarket] = useState(MARKETS[0].value);
-  const [isScanning, setIsScanning] = useState(false);
-  const [scanComplete, setScanComplete] = useState(false);
-  const [scanTimestamp, setScanTimestamp] = useState<Date | null>(null);
-  const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[0].value);
+  const { scans } = useLoaderData<typeof loader>();
+  const runScanFetcher = useFetcher<typeof action>();
+  const applyFetcher = useFetcher<typeof action>();
+
+  const [history, setHistory] = useState<SerializedScan[]>(scans);
+  const [selectedScanId, setSelectedScanId] = useState<string | null>(scans[0]?.id ?? null);
+  const [market, setMarket] = useState<string>("uk");
   const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
-  const [findings, setFindings] = useState(MOCK_FINDINGS);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [suggestionDrafts, setSuggestionDrafts] = useState<Record<string, string>>({});
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  useEffect(() => () => timeoutRef.current && clearTimeout(timeoutRef.current), []);
+  useEffect(() => {
+    if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
+      setHistory((prev) => [runScanFetcher.data.scan, ...prev].slice(0, 5));
+      setSelectedScanId(runScanFetcher.data.scan.id);
+    }
+  }, [runScanFetcher.state, runScanFetcher.data]);
 
-  const metrics = MARKET_METRICS[selectedMarket] ?? MARKET_METRICS.uk;
+  useEffect(() => {
+    if (applyFetcher.state === "idle") {
+      if (applyFetcher.data?.applied) {
+        setStatusMessage("AI suggestion applied to product description");
+      } else if (applyFetcher.data?.error) {
+        setStatusMessage(applyFetcher.data.error);
+      }
+    }
+  }, [applyFetcher.state, applyFetcher.data]);
 
-  const filteredFindings = useMemo(
-    () =>
-      findings
-        .filter((finding) => finding.market === selectedMarket)
-        .slice(0, Number(pageSize)),
-    [findings, selectedMarket, pageSize],
-  );
+  const displayedScan = useMemo(() => {
+    if (!selectedScanId) return history[0];
+    return history.find((scan) => scan.id === selectedScanId) ?? history[0];
+  }, [history, selectedScanId]);
 
-  const handleMarketChange = useCallback((value: string) => {
-    setSelectedMarket(value);
-    setScanComplete(false);
-    setScanTimestamp(null);
-  }, []);
+  useEffect(() => {
+    if (displayedScan) {
+      const drafts: Record<string, string> = {};
+      displayedScan.results.forEach((result) => {
+        drafts[result.productId] = result.suggestion;
+      });
+      setSuggestionDrafts(drafts);
+    }
+  }, [displayedScan?.id]);
 
-  const handleRunScan = useCallback(() => {
-    if (isScanning) return;
-    setIsScanning(true);
-    setScanComplete(false);
-    timeoutRef.current && clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => {
-      setIsScanning(false);
-      setScanComplete(true);
-      setScanTimestamp(new Date());
-    }, 1800);
-  }, [isScanning]);
+  const isScanning = runScanFetcher.state !== "idle";
+  const applyingProductId =
+    applyFetcher.state !== "idle" ? applyFetcher.formData?.get("productId")?.toString() : null;
 
-  const updateSuggestion = useCallback((id: string, value: string) => {
-    setFindings((current) =>
-      current.map((finding) => (finding.id === id ? { ...finding, suggestion: value } : finding)),
-    );
-  }, []);
+  const scanHistoryOptions = history.map((scan) => ({
+    label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
+    value: scan.id,
+  }));
 
-  const handleApplyFix = useCallback((id: string) => {
-    console.info("Applying AI fix for", id);
-  }, []);
+  const metrics = displayedScan
+    ? {
+        complianceScore: displayedScan.complianceScore ?? 0,
+        violations: displayedScan.violations,
+        productsScanned: displayedScan.productsScanned,
+        timestamp: displayedScan.completedAt ?? displayedScan.startedAt,
+        market: displayedScan.market,
+      }
+    : null;
 
-  const openUpgradeModal = useCallback(() => setUpgradeModalOpen(true), []);
-  const closeUpgradeModal = useCallback(() => setUpgradeModalOpen(false), []);
-
-  const scanDescription =
-    "This scan reviews your product titles, descriptions, URLs, meta data, and theme content for restricted terms, misleading claims, or policy violations. It uses AI to analyze Google Ads and local law guidelines in real time.";
-
-  const dataRows = filteredFindings.map((finding) => [
-    finding.title,
-    finding.issue,
+  const rows = (displayedScan?.results ?? []).map((result) => [
+    <Text key={`${result.productId}-title`} variant="bodyMd">{result.productTitle}</Text>,
+    <div key={`${result.productId}-issues`}>
+      {result.issues.length === 0 ? (
+        <Badge tone="success">Clean</Badge>
+      ) : (
+        <Stack gap="200">
+          {result.issues.map((issue) => (
+            <Text key={`${result.productId}-${issue}`} as="span" tone="critical">
+              {issue}
+            </Text>
+          ))}
+        </Stack>
+      )}
+    </div>,
     <TextField
-      key={`${finding.id}-suggestion`}
-      value={finding.suggestion}
-      onChange={(value) => updateSuggestion(finding.id, value)}
+      key={`${result.productId}-suggestion`}
+      value={suggestionDrafts[result.productId] ?? result.suggestion}
+      onChange={(value) =>
+        setSuggestionDrafts((prev) => ({
+          ...prev,
+          [result.productId]: value,
+        }))
+      }
       multiline
     />,
-    <InlineStack key={`${finding.id}-actions`} gap="200">
-      <Button size="slim" onClick={() => handleApplyFix(finding.id)}>
-        Apply Fix
-      </Button>
+    <InlineStack key={`${result.productId}-actions`} gap="200" blockAlign="center">
+      <applyFetcher.Form method="post">
+        <input type="hidden" name="intent" value="applySuggestion" />
+        <input type="hidden" name="productId" value={result.productId} />
+        <input
+          type="hidden"
+          name="suggestion"
+          value={suggestionDrafts[result.productId] ?? result.suggestion}
+        />
+        <Button
+          size="slim"
+          submit
+          disabled={applyFetcher.state !== "idle" && applyingProductId === result.productId}
+        >
+          {applyingProductId === result.productId && applyFetcher.state !== "idle" ? (
+            <InlineStack gap="100" blockAlign="center">
+              <Spinner size="small" />
+              <span>Applying…</span>
+            </InlineStack>
+          ) : (
+            "Apply AI Fix"
+          )}
+        </Button>
+      </applyFetcher.Form>
       <Button size="slim" variant="plain">
         Edit & Apply
       </Button>
@@ -176,8 +259,8 @@ export default function AppScansPage() {
             AI Compliance Scan
           </Text>
           <Text tone="subdued" as="p">
-            Scan {shopName}'s catalog for Google Ads and regional policy violations across products, descriptions, metadata, and theme
-            content.
+            Scan {displayedScan?.shopDomain ?? "your store"}'s catalog for Google Ads and regional policy violations across products,
+            descriptions, metadata, and theme content.
           </Text>
         </Layout.Section>
         <Layout.Section>
@@ -192,62 +275,45 @@ export default function AppScansPage() {
               <Select
                 label="Select market to scan"
                 options={MARKETS}
-                value={selectedMarket}
-                onChange={handleMarketChange}
+                value={market}
+                onChange={setMarket}
               />
               <Text as="p" tone="subdued">
                 Scanning Google Ads policies and local laws for the selected market…
               </Text>
+              {history.length > 0 && (
+                <Select
+                  label="Scan history"
+                  options={scanHistoryOptions}
+                  value={selectedScanId ?? undefined}
+                  onChange={(value) => setSelectedScanId(value)}
+                  placeholder="Most recent"
+                />
+              )}
             </Stack>
           </Card>
         </Layout.Section>
 
         <Layout.Section>
           <Layout>
-            {[
-              {
-                title: "Products Scanned",
-                value: metrics.scanned.toLocaleString(),
-                description: "Items analyzed for Google Ads and local law compliance.",
-                icon: ProductIcon,
-              },
-              {
-                title: "Issues Found",
-                value: metrics.issues.toLocaleString(),
-                description: "Policy or legal violations detected this scan.",
-                icon: AlertCircleIcon,
-              },
-              {
-                title: "AI Fixes Suggested",
-                value: metrics.fixes.toLocaleString(),
-                description: "Draft remediations generated by our AI assistant.",
-                icon: CheckCircleIcon,
-              },
-            ].map((metric, index) => (
+            {getMetricCards(metrics).map((metric, index) => (
               <Layout.Section key={metric.title} variant="oneThird">
-                <motion.div
-                  variants={metricVariants}
-                  initial="hidden"
-                  animate="visible"
-                  transition={{ delay: 0.1 * index }}
-                >
-                  <Card>
-                    <Stack spacing="400" alignment="center">
-                      <Icon source={metric.icon} tone="primary" />
-                      <div>
-                        <Text variant="headingMd" as="h3">
-                          {metric.title}
-                        </Text>
-                        <Text variant="headingLg" as="p">
-                          {metric.value}
-                        </Text>
-                        <Text as="p" tone="subdued">
-                          {metric.description}
-                        </Text>
-                      </div>
-                    </Stack>
-                  </Card>
-                </motion.div>
+                <Card>
+                  <Stack spacing="300" alignment="center">
+                    <Icon source={metric.icon} tone="primary" />
+                    <div>
+                      <Text variant="headingMd" as="h3">
+                        {metric.title}
+                      </Text>
+                      <Text variant="headingLg" as="p">
+                        {metric.value}
+                      </Text>
+                      <Text as="p" tone="subdued">
+                        {metric.description}
+                      </Text>
+                    </div>
+                  </Stack>
+                </Card>
               </Layout.Section>
             ))}
           </Layout>
@@ -256,24 +322,29 @@ export default function AppScansPage() {
         <Layout.Section>
           <Card title="Run New Scan" sectioned>
             <Text as="p" tone="subdued">
-              {scanDescription}
+              This scan reviews your product titles, descriptions, URLs, meta data, and theme content for restricted terms, misleading
+              claims, or policy violations. It uses AI to analyze Google Ads and local law guidelines in real time.
             </Text>
             <InlineStack gap="300" blockAlign="center" style={{ marginTop: "var(--p-space-400)" }}>
-              <Button onClick={handleRunScan} primary disabled={isScanning}>
-                {isScanning ? (
-                  <InlineStack gap="200" blockAlign="center">
-                    <Spinner size="small" />
-                    <span>Scanning…</span>
-                  </InlineStack>
-                ) : (
-                  "Run Compliance Scan"
-                )}
-              </Button>
-              {scanTimestamp && !isScanning ? (
+              <runScanFetcher.Form method="post">
+                <input type="hidden" name="intent" value="startScan" />
+                <input type="hidden" name="market" value={market} />
+                <Button primary submit disabled={isScanning}>
+                  {isScanning ? (
+                    <InlineStack gap="200" blockAlign="center">
+                      <Spinner size="small" />
+                      <span>Scanning…</span>
+                    </InlineStack>
+                  ) : (
+                    "Run Compliance Scan"
+                  )}
+                </Button>
+              </runScanFetcher.Form>
+              {metrics?.timestamp && (
                 <Text as="span" tone="subdued">
-                  Last scan: {scanTimestamp.toLocaleString()}
+                  Last scan: {formatTimestamp(metrics.timestamp)} ({metrics.market.toUpperCase()})
                 </Text>
-              ) : null}
+              )}
             </InlineStack>
             {isScanning && (
               <div style={{ marginTop: "var(--p-space-400)" }}>
@@ -284,7 +355,15 @@ export default function AppScansPage() {
           </Card>
         </Layout.Section>
 
-        {scanComplete && (
+        {statusMessage && (
+          <Layout.Section>
+            <Banner status="success" onDismiss={() => setStatusMessage(null)}>
+              {statusMessage}
+            </Banner>
+          </Layout.Section>
+        )}
+
+        {displayedScan && (
           <Layout.Section>
             <Card>
               <Stack spacing="400">
@@ -293,58 +372,282 @@ export default function AppScansPage() {
                     Scan Results
                   </Text>
                   <Text as="p" tone="subdued">
-                    Review flagged items, refine AI suggestions, and apply fixes before publishing to Google Ads.
+                    Review flagged products and apply AI powered fixes instantly.
                   </Text>
                 </div>
                 <Divider />
                 <InlineStack align="space-between" blockAlign="center">
                   <InlineStack gap="200" blockAlign="center">
-                    <Button onClick={openUpgradeModal}>Apply All AI Fixes</Button>
+                    <Button onClick={() => setUpgradeModalOpen(true)}>Apply All AI Suggestions</Button>
                     <Text as="span" tone="subdued">
-                      Upgrade required for 1-click remediation.
+                      Upgrade required for automatic remediation.
                     </Text>
                   </InlineStack>
                   <Select
                     labelHidden
                     label="Rows per page"
                     options={PAGE_SIZE_OPTIONS}
-                    value={pageSize}
-                    onChange={setPageSize}
+                    value={pageSizeFromResults(displayedScan.results)}
+                    onChange={() => {}}
+                    disabled
                   />
                 </InlineStack>
                 <DataTable
                   columnContentTypes={["text", "text", "text", "text"]}
-                  headings={["Product", "Issue", "AI Suggestion", "Actions"]}
-                  rows={dataRows}
+                  headings={["Product", "Issues", "AI Suggestion", "Actions"]}
+                  rows={rows}
                 />
               </Stack>
             </Card>
           </Layout.Section>
         )}
 
-        <Layout.Section>
-          <Card sectioned>
-            <Text as="p" tone="subdued">
-              Powered by OpenAI — our engine continuously checks Google Ads documentation, Merchant Center policies, and regional legal databases to keep your scans fresh.
-            </Text>
-            <Link url="mailto:support@aithorapp.co.uk">Questions? Contact compliance support.</Link>
-          </Card>
-        </Layout.Section>
+        {!displayedScan && (
+          <Layout.Section>
+            <Card sectioned>
+              <Text>No scans yet. Kick off your first scan to see results here.</Text>
+            </Card>
+          </Layout.Section>
+        )}
       </Layout>
 
       <Modal
         open={upgradeModalOpen}
-        onClose={closeUpgradeModal}
+        onClose={() => setUpgradeModalOpen(false)}
         title="Upgrade your plan to automatically apply AI compliance fixes"
-        primaryAction={{ content: "Upgrade Plan", onAction: closeUpgradeModal }}
-        secondaryActions={[{ content: "Not now", onAction: closeUpgradeModal }]}
+        primaryAction={{ content: "Upgrade Plan", onAction: () => setUpgradeModalOpen(false) }}
+        secondaryActions={[{ content: "Maybe later", onAction: () => setUpgradeModalOpen(false) }]}
       >
         <Modal.Section>
           <Text as="p" tone="subdued">
-            Batch remediation, scheduling, and policy exports are available on the Growth and Agency plans.
+            Batch remediation, scheduling, and policy exports are available on the Growth and Agency plans. Contact support to enable
+            these features.
           </Text>
         </Modal.Section>
       </Modal>
     </>
   );
+}
+
+const MARKETS = [
+  { label: "United Kingdom", value: "uk" },
+  { label: "United States", value: "us" },
+  { label: "European Union", value: "eu" },
+  { label: "Australia", value: "au" },
+  { label: "Canada", value: "ca" },
+];
+
+const PAGE_SIZE_OPTIONS = [
+  { label: "10 rows", value: "10" },
+  { label: "25 rows", value: "25" },
+  { label: "50 rows", value: "50" },
+  { label: "100 rows", value: "100" },
+];
+
+function pageSizeFromResults(results: ComplianceFinding[]) {
+  if (results.length <= 10) return "10";
+  if (results.length <= 25) return "25";
+  if (results.length <= 50) return "50";
+  return "100";
+}
+
+function formatTimestamp(value: string) {
+  return new Date(value).toLocaleString();
+}
+
+function wrapSuggestionHtml(text: string) {
+  const normalized = text.trim();
+  if (!normalized) return "";
+  return normalized.startsWith("<") ? normalized : `<p>${normalized}</p>`;
+}
+
+function serializeScan(scan: Scan): SerializedScan {
+  return {
+    ...scan,
+    startedAt: scan.startedAt.toISOString(),
+    completedAt: scan.completedAt ? scan.completedAt.toISOString() : null,
+    results: (scan.results as ComplianceFinding[] | null) ?? [],
+  };
+}
+
+async function runComplianceScan({ admin, session, market }: any) {
+  const response = await admin.graphql(PRODUCTS_QUERY, { variables: { first: 5 } });
+  const body = await response.json();
+  const products = body?.data?.products?.nodes ?? [];
+  const rules = getPolicyRules(market);
+
+  const openAiClient = process.env.OPENAI_API_KEY
+    ? new (await import("openai")).default({ apiKey: process.env.OPENAI_API_KEY })
+    : null;
+
+  const results: ComplianceFinding[] = [];
+
+  for (const product of products) {
+    const finding = await analyzeProduct({ product, rules, market, openAiClient });
+    results.push(finding);
+  }
+
+  const violations = results.filter((result) => result.status === "flagged").length;
+  const complianceScore = results.length
+    ? Math.round(results.reduce((sum, r) => sum + r.complianceScore, 0) / results.length)
+    : 100;
+
+  const saved = await prisma.scan.create({
+    data: {
+      shopDomain: session.shop,
+      market,
+      complianceScore,
+      violations,
+      productsScanned: results.length,
+      status: "complete",
+      completedAt: new Date(),
+      results,
+    },
+  });
+
+  return saved;
+}
+
+async function analyzeProduct({
+  product,
+  rules,
+  market,
+  openAiClient,
+}: {
+  product: any;
+  rules: PolicyRule[];
+  market: string;
+  openAiClient: any;
+}): Promise<ComplianceFinding> {
+  const plainDescription = stripHtml(product.descriptionHtml ?? "");
+  const metafieldsText = (product.metafields?.edges ?? [])
+    .map((edge: any) => `${edge.node.namespace} ${edge.node.key} ${edge.node.value}`)
+    .join(" ");
+  const combined = `${product.title}\n${plainDescription}\n${product.tags?.join(" ") ?? ""}\n${metafieldsText}`.toLowerCase();
+
+  const matches = detectPolicyMatches(combined, rules);
+  const issues = matches.map((match) => `${match.rule.category}: ${match.rule.description}`);
+
+  const severityScore = matches.reduce((sum, match) => sum + (match.rule.severity === "high" ? 30 : match.rule.severity === "medium" ? 15 : 5), 0);
+  const complianceScore = Math.max(0, 100 - severityScore);
+  const status: "flagged" | "clean" = issues.length ? "flagged" : "clean";
+  const fallbackSuggestion = issues.length
+    ? `Rewrite copy to remove: ${matches.map((m) => m.matchingWords.join(", ")).join("; ")}`
+    : "No changes required. Product looks compliant.";
+
+  const suggestion = issues.length
+    ? await buildAiSuggestion({
+        openAiClient,
+        market,
+        productTitle: product.title,
+        description: plainDescription,
+        fallback: fallbackSuggestion,
+      })
+    : fallbackSuggestion;
+
+  return {
+    productId: product.id,
+    legacyResourceId: product.legacyResourceId?.toString(),
+    productTitle: product.title,
+    market,
+    matchedKeywords: matches.flatMap((match) => match.matchingWords),
+    issues,
+    policyArea: matches.map((m) => m.rule.category).join(", ") || "None",
+    suggestion,
+    aiSummary: suggestion,
+    complianceScore,
+    status,
+  };
+}
+
+function detectPolicyMatches(text: string, rules: PolicyRule[]) {
+  return rules
+    .map((rule) => {
+      const matchingWords = rule.keywords.filter((keyword) => text.includes(keyword.toLowerCase()));
+      return matchingWords.length ? { rule, matchingWords } : null;
+    })
+    .filter(Boolean) as { rule: PolicyRule; matchingWords: string[] }[];
+}
+
+async function buildAiSuggestion({
+  openAiClient,
+  market,
+  productTitle,
+  description,
+  fallback,
+}: {
+  openAiClient: any;
+  market: string;
+  productTitle: string;
+  description: string;
+  fallback: string;
+}) {
+  if (!openAiClient) return fallback;
+
+  try {
+    const completion = await openAiClient.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a Google Ads and local law compliance reviewer. Suggest concise, policy-safe product description text (max 80 words).",
+        },
+        {
+          role: "user",
+          content: `Market: ${market.toUpperCase()}\nProduct: ${productTitle}\nDescription: ${description}\nRewrite this description so that it follows Google Ads and local laws.`,
+        },
+      ],
+    });
+    return completion.choices?.[0]?.message?.content?.trim() ?? fallback;
+  } catch (error) {
+    console.error("OpenAI suggestion failed", error);
+    return fallback;
+  }
+}
+
+function stripHtml(raw: string) {
+  return raw.replace(/<[^>]*>?/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function getMetricCards(metrics: ReturnType<typeof buildMetrics>) {
+  const computed = buildMetrics(metrics);
+  return [
+    {
+      title: "Products Scanned",
+      value: computed.productsScanned,
+      description: "Items analyzed for Google Ads and legal compliance.",
+      icon: ProductIcon,
+    },
+    {
+      title: "Violations Found",
+      value: computed.violations,
+      description: "Policy or local law issues detected in this scan.",
+      icon: AlertCircleIcon,
+    },
+    {
+      title: "Compliance Score",
+      value: `${computed.complianceScore}%`,
+      description: "Average approval likelihood for this market.",
+      icon: CheckCircleIcon,
+    },
+  ];
+}
+
+function buildMetrics(metrics: {
+  complianceScore: number;
+  violations: number;
+  productsScanned: number;
+  timestamp: string;
+  market: string;
+} | null) {
+  if (!metrics) {
+    return {
+      complianceScore: 0,
+      violations: 0,
+      productsScanned: 0,
+    };
+  }
+  return metrics;
 }
