@@ -388,7 +388,11 @@ export default function AppScansPage() {
         </Layout.Section>
 
       <Layout.Section>
-        {!aiConnected && (
+        {aiConnected ? (
+          <Banner status="success" title="AI connection active">
+            Analysis powered by OpenAI GPT-4o-mini.
+          </Banner>
+        ) : (
           <Banner status="critical" title="AI connection failed">
             <p>We couldn’t connect to OpenAI. Please check your API key or try again later.</p>
           </Banner>
@@ -655,9 +659,8 @@ async function analyzeProduct({
   const matches = detectPolicyMatches(combined, rules);
   const issues = matches.map((match) => `${match.rule.category}: ${match.rule.description}`);
 
-  const severityScore = matches.reduce((sum, match) => sum + (match.rule.severity === "high" ? 30 : match.rule.severity === "medium" ? 15 : 5), 0);
-  const complianceScore = Math.max(0, 100 - severityScore);
-  const status: "flagged" | "clean" = issues.length ? "flagged" : "clean";
+  const basePenalty = matches.reduce((sum, match) => sum + (match.rule.severity === "high" ? 30 : match.rule.severity === "medium" ? 15 : 5), 0);
+  const baseScore = Math.max(0, 100 - basePenalty);
   const fallbackSuggestions: PhraseSuggestion[] = matches.length
     ? matches.map((match) => ({
         original: match.matchingWords[0] ?? "",
@@ -666,15 +669,17 @@ async function analyzeProduct({
       }))
     : [];
 
-  const phraseSuggestions = matches.length
-    ? await buildAiSuggestions({
-        openAiClient,
-        market,
-        productTitle: product.title,
-        description: plainDescription,
-        fallback: fallbackSuggestions,
-      })
-    : [];
+  const phraseSuggestions = await buildAiSuggestions({
+    openAiClient,
+    market,
+    productTitle: product.title,
+    description: plainDescription,
+    hints: matches.map((match) => match.rule.description),
+    fallback: fallbackSuggestions,
+  });
+
+  const status: "flagged" | "clean" = issues.length || phraseSuggestions.length ? "flagged" : "clean";
+  const complianceScore = Math.max(0, baseScore - phraseSuggestions.length * 10);
 
   return {
     productId: product.id,
@@ -704,12 +709,14 @@ async function buildAiSuggestions({
   market,
   productTitle,
   description,
+  hints,
   fallback,
 }: {
   openAiClient: any;
   market: string;
   productTitle: string;
   description: string;
+  hints: string[];
   fallback: PhraseSuggestion[];
 }): Promise<PhraseSuggestion[]> {
   if (!openAiClient) return fallback;
@@ -727,7 +734,7 @@ async function buildAiSuggestions({
         },
         {
           role: "user",
-          content: `Market: ${market.toUpperCase()}\nProduct: ${productTitle}\nDescription: ${description}\nReturn JSON {"phrases": [{"original":"", "replacement":"", "reason":""}, ...]}. Only include phrases that actually appear in the text.`,
+          content: `Market: ${market.toUpperCase()}\nProduct: ${productTitle}\nDescription: ${description}\nKnown heuristics: ${hints.join("; ") || "None"}\nReturn JSON {"phrases": [{"original":"", "replacement":"", "reason":""}, ...]}. Only include phrases that actually appear in the text and explain why they're risky.`,
         },
       ],
     });
