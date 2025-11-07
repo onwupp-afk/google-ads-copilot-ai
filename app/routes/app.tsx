@@ -3,20 +3,16 @@ import { json, redirect } from "@remix-run/node";
 import {
   Outlet,
   useLoaderData,
-  useLocation,
   useRouteError,
+  useSearchParams,
 } from "@remix-run/react";
+import { useMemo } from "react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
+import { TitleBar } from "@shopify/app-bridge-react/components/TitleBar";
+import { NavMenu } from "@shopify/app-bridge-react/components/NavMenu";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
-import {
-  Button,
-  Frame,
-  Navigation,
-  Text,
-  TopBar,
-} from "@shopify/polaris";
-import { useMemo, useState } from "react";
+import { Card, Frame, Page, Text } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
@@ -51,10 +47,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     return buildLoginRedirect(url);
   }
 
-  if (!host) {
-    return buildLoginRedirect(url);
-  }
-
+  const missingHost = !host;
   const persistentSearch = searchParams.toString();
 
   return json({
@@ -64,6 +57,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     embedded,
     sessionToken,
     persistentSearch,
+    missingHost,
   });
 };
 
@@ -73,11 +67,28 @@ export type AppContext = {
   persistentSearch: string | null;
 };
 
+function useLinkWithParams(fallback: string | null) {
+  const [params] = useSearchParams();
+  const query = params.toString() || fallback || "";
+  return useMemo(
+    () =>
+      (path: string) =>
+        query.length ? `${path}?${query}` : path,
+    [query],
+  );
+}
+
 export default function App() {
-  const { apiKey, host, shop, embedded, sessionToken, persistentSearch } =
-    useLoaderData<typeof loader>();
-  const location = useLocation();
-  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
+  const {
+    apiKey,
+    host,
+    shop,
+    embedded,
+    sessionToken,
+    persistentSearch,
+    missingHost,
+  } = useLoaderData<typeof loader>();
+  const linkWithParams = useLinkWithParams(persistentSearch);
 
   const persistentParams = useMemo(() => {
     if (persistentSearch && persistentSearch.length > 0) {
@@ -89,51 +100,51 @@ export default function App() {
     return params.toString();
   }, [embedded, host, persistentSearch, sessionToken, shop]);
 
-  const withParams = (path: string) => {
-    if (!persistentParams) return path;
-    return `${path}?${persistentParams}`;
-  };
-
-  const navigationMarkup = (
-    <Navigation location={location.pathname}>
-      <Navigation.Section
-        items={[
-          { label: "Dashboard", url: withParams("/app"), exactMatch: true },
-          { label: "Scan", url: withParams("/app/scans") },
-          { label: "Settings", url: withParams("/app/settings") },
-        ]}
-      />
-    </Navigation>
-  );
-
-  const topBarMarkup = (
-    <TopBar
-      showNavigationToggle
-      onNavigationToggle={() => setIsMobileNavOpen((state) => !state)}
-      contextControl={
-        <Text as="span" variant="headingSm">
-          {shop.replace(".myshopify.com", "")}
-        </Text>
-      }
-      secondaryMenu={<Button url={withParams("/app/settings")}>Upgrade</Button>}
-    />
-  );
+  if (missingHost) {
+    return (
+      <Page title="Open from Shopify">
+        <Card sectioned>
+          <Text as="p">
+            This app needs to be launched from Shopify Admin so it can load the store context. Return to Shopify and click Apps →
+            Google Ads Policy & Local Laws Copilot → Open app to continue.
+          </Text>
+        </Card>
+      </Page>
+    );
+  }
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
-      <Frame
-        navigation={navigationMarkup}
-        topBar={topBarMarkup}
-        showMobileNavigation={isMobileNavOpen}
-        onNavigationDismiss={() => setIsMobileNavOpen(false)}
-      >
-        <Outlet
-          context={{
-            host,
-            shop,
-            persistentSearch: persistentParams || null,
+      <NavMenu>
+        <a data-primary-nav-item href={linkWithParams("/app")}>Dashboard</a>
+        <a data-primary-nav-item href={linkWithParams("/app/scans")}>Scans</a>
+        <a data-primary-nav-item href={linkWithParams("/app/settings")}>Settings</a>
+        <a
+          data-secondary-nav-item
+          href="https://aithorapp.co.uk/support"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Support
+        </a>
+      </NavMenu>
+      <Frame>
+        <TitleBar
+          title="Google Ads Policy & Local Laws Copilot"
+          primaryAction={{
+            content: "Upgrade",
+            url: linkWithParams("/app/settings"),
           }}
         />
+        <Page>
+          <Outlet
+            context={{
+              host,
+              shop,
+              persistentSearch: persistentParams || null,
+            }}
+          />
+        </Page>
       </Frame>
     </AppProvider>
   );

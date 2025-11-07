@@ -13,7 +13,6 @@ import {
   Layout,
   LegacyStack as Stack,
   Link,
-  Page,
   SkeletonBodyText,
   SkeletonDisplayText,
   Text,
@@ -68,10 +67,7 @@ export default function AppDashboard() {
     persistentSearch && persistentSearch.length > 0 ? `${path}?${persistentSearch}` : path;
 
   return (
-    <Page
-      title="Google Ads Policy & Local Laws Copilot"
-      subtitle="AI-powered compliance assistant that keeps your products approved and compliant with local laws."
-    >
+    <>
       <Card>
         <Stack alignment="center" spacing="400">
           <Text variant="headingLg" as="h1">
@@ -197,6 +193,6 @@ export default function AppDashboard() {
           Powered by AITHOR — Policy Intelligence for Google Ads & Local Laws.
         </Text>
       </div>
-    </Page>
+    </>
   );
 }

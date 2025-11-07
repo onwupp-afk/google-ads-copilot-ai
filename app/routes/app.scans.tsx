@@ -14,7 +14,6 @@ import {
   LegacyStack as Stack,
   Link,
   Modal,
-  Page,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
@@ -170,11 +169,17 @@ export default function AppScansPage() {
   ]);
 
   return (
-    <Page
-      title="AI Compliance Scan"
-      subtitle={`Scan ${shopName}'s catalog for Google Ads and regional policy violations across products, descriptions, metadata, and theme content.`}
-    >
+    <>
       <Layout>
+        <Layout.Section>
+          <Text variant="headingLg" as="h1">
+            AI Compliance Scan
+          </Text>
+          <Text tone="subdued" as="p">
+            Scan {shopName}'s catalog for Google Ads and regional policy violations across products, descriptions, metadata, and theme
+            content.
+          </Text>
+        </Layout.Section>
         <Layout.Section>
           <Banner status="info">
             This AI-powered scan uses OpenAI to stay up to date with the latest Google Ads and local law policies automatically.
@@ -340,6 +345,6 @@ export default function AppScansPage() {
           </Text>
         </Modal.Section>
       </Modal>
-    </Page>
+    </>
   );
 }
