@@ -28,14 +28,16 @@ export const links: LinksFunction = () => [
 ];
 
 export async function loader({ request }: LoaderFunctionArgs) {
+  const url = new URL(request.url);
   return json({
     apiKey: process.env.SHOPIFY_API_KEY,
+    host: url.searchParams.get("host"),
     embedded: true,
   });
 }
 
 export default function Root() {
-  const { apiKey, embedded } = useLoaderData<typeof loader>();
+  const { apiKey, host, embedded } = useLoaderData<typeof loader>();
   return (
     <html lang="en">
       <head>
@@ -43,7 +45,7 @@ export default function Root() {
         <Links />
       </head>
       <body>
-        <ShopifyAppProvider apiKey={apiKey} isEmbeddedApp={embedded}>
+        <ShopifyAppProvider apiKey={apiKey} host={host ?? undefined} isEmbeddedApp={embedded}>
           <PolarisProvider i18n={en}>
             <Outlet />
           </PolarisProvider>
