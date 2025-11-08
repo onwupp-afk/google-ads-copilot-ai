@@ -8,7 +8,6 @@ import {
   Banner,
   Button,
   Card,
-  DataTable,
   Divider,
   Icon,
   InlineStack,
@@ -180,58 +179,66 @@ export default function AppScansPage() {
     return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
   }, [displayedScan, currentPage]);
 
-  const rows = visibleResults.map((result) => {
+  const resultSections = visibleResults.map((result, resultIndex) => {
     const hasViolations = result.violations.length > 0;
-    return [
-      <Stack key={`${result.productId}-product`} vertical spacing="200">
-        <Text variant="bodyMd" as="span">
-          {result.productTitle}
-        </Text>
-        <Text tone="subdued" as="span">
-          {hasViolations ? `${result.violations.length} violation${result.violations.length === 1 ? "" : "s"}` : "Clean"}
-        </Text>
-      </Stack>,
-      hasViolations ? (
-        <Stack key={`${result.productId}-policies`} vertical spacing="200">
-          {result.violations.map((violation, index) => (
-            <div key={`${result.productId}-violation-${index}`}>
-              <InlineStack gap="200" align="space-between">
-                <InlineStack gap="200" blockAlign="center">
-                  <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
-                  <Badge tone={riskTone(violation.riskScore)}>
-                    Risk {formatRisk(violation.riskScore)}
-                  </Badge>
-                </InlineStack>
-                {violation.sourceUrl && (
-                  <Link url={violation.sourceUrl} target="_blank">
-                    Reference
-                  </Link>
-                )}
-              </InlineStack>
-              <Text variant="bodySm" as="p">
-                <strong>{violation.policy}</strong> · {violation.law}
+    const summaryBadgeTone = hasViolations ? "critical" : "success";
+
+    return (
+      <div key={`${result.productId}-section`}>
+        <Stack vertical spacing="300">
+          <InlineStack align="space-between" blockAlign="start">
+            <div>
+              <Text variant="headingSm" as="h3">
+                {result.productTitle}
               </Text>
-              <Text variant="bodySm" tone="subdued" as="p">
-                {violation.issue}
+              <Text tone="subdued" as="p">
+                {hasViolations
+                  ? `${result.violations.length} violation${result.violations.length === 1 ? "" : "s"} detected`
+                  : "No violations detected"}
               </Text>
             </div>
-          ))}
+            <Badge tone={summaryBadgeTone}>
+              {hasViolations ? "Flagged" : "Clean"}
+            </Badge>
+          </InlineStack>
+
+          {hasViolations ? (
+            <Stack vertical spacing="200">
+              {result.violations.map((violation, index) => (
+                <div key={`${result.productId}-violation-${index}`}>
+                  <InlineStack gap="200" align="space-between">
+                    <InlineStack gap="200" blockAlign="center">
+                      <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
+                      <Badge tone={riskTone(violation.riskScore)}>
+                        Risk {formatRisk(violation.riskScore)}
+                      </Badge>
+                    </InlineStack>
+                    {violation.sourceUrl && (
+                      <Link url={violation.sourceUrl} target="_blank">
+                        Policy reference
+                      </Link>
+                    )}
+                  </InlineStack>
+                  <Text variant="bodySm" as="p">
+                    <strong>{violation.policy}</strong> · {violation.law}
+                  </Text>
+                  <Text variant="bodySm" tone="subdued" as="p">
+                    {violation.issue}
+                  </Text>
+                  <Text variant="bodySm" as="p">
+                    <strong>AI guidance:</strong> {violation.suggestion}
+                  </Text>
+                  {index < result.violations.length - 1 && <Divider />}
+                </div>
+              ))}
+            </Stack>
+          ) : (
+            <Text tone="subdued">Everything looks compliant for this product.</Text>
+          )}
         </Stack>
-      ) : (
-        <Badge tone="success">No violations</Badge>
-      ),
-      hasViolations ? (
-        <Stack key={`${result.productId}-suggestions`} vertical spacing="200">
-          {result.violations.map((violation, index) => (
-            <Text key={`${result.productId}-suggestion-${index}`} variant="bodySm" as="p">
-              {violation.suggestion}
-            </Text>
-          ))}
-        </Stack>
-      ) : (
-        <Text tone="subdued">No action required.</Text>
-      ),
-    ];
+        {resultIndex < visibleResults.length - 1 && <Divider />}
+      </div>
+    );
   });
 
   return (
@@ -397,11 +404,9 @@ export default function AppScansPage() {
                 {visibleResults.length === 0 ? (
                   <Text tone="subdued">No products matched this page.</Text>
                 ) : (
-                  <DataTable
-                    columnContentTypes={["text", "text", "text"]}
-                    headings={["Product", "Policy & Law Context", "AI Guidance"]}
-                    rows={rows}
-                  />
+                  <Stack vertical spacing="400">
+                    {resultSections}
+                  </Stack>
                 )}
               </Stack>
             </Card>
