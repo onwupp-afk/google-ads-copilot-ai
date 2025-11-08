@@ -30,6 +30,7 @@ import {
   Link,
   Modal,
   Popover,
+  ProgressBar,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
@@ -54,6 +55,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { AnimatePresence, motion } from "framer-motion";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import {
@@ -175,6 +177,13 @@ export default function ComplianceDashboardPage() {
   const [localHistory, setLocalHistory] = useState(history);
   const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
   const [bulkApplying, setBulkApplying] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [totalProducts, setTotalProducts] = useState(0);
+  const [currentProductIndex, setCurrentProductIndex] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("Initializing scan…");
+  const [scanCompleteState, setScanCompleteState] = useState<"idle" | "success" | "error">("idle");
+  const [lastAnimatedScanId, setLastAnimatedScanId] = useState<string | null>(null);
 
   const appBridge = useAppBridge();
 
@@ -202,22 +211,99 @@ export default function ComplianceDashboardPage() {
     [appBridge],
   );
 
-  useEffect(() => {
-    if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
-      setScanHistory((prev) => [runScanFetcher.data!.scan, ...prev].slice(0, 5));
-      setSelectedScanId(runScanFetcher.data.scan.id);
+  const finalizeScan = useCallback(
+    (scan: SerializedScan, toastMessage?: string) => {
+      setScanHistory((prev) => [scan, ...prev].slice(0, 5));
+      setSelectedScanId(scan.id);
       setCurrentPage(0);
       setLocalHistory((prev) => [
         ...prev,
-        ...runScanFetcher.data!.scan.results.map((result) => ({
+        ...scan.results.map((result) => ({
           productId: result.productId,
-          scannedAt: new Date().toISOString(),
+          scannedAt: scan.completedAt ?? new Date().toISOString(),
           complianceScore: result.complianceScore ?? 0,
         })),
       ]);
-      triggerToast(runScanFetcher.data.toast);
+      if (toastMessage) {
+        triggerToast(toastMessage);
+      }
+    },
+    [setScanHistory, setSelectedScanId, setCurrentPage, setLocalHistory, triggerToast],
+  );
+
+  const animateScanProgress = useCallback(
+    (scan: SerializedScan, toastMessage?: string) => {
+      const total = scan.results.length || scan.productsScanned || 1;
+      setTotalProducts(total);
+      setCurrentProductIndex(0);
+      setProgress(5);
+      setProgressLabel("Scanning products…");
+
+      const perProductDelay = 450;
+      const results = scan.results.length
+        ? scan.results
+        : Array.from({ length: total }).map((_, index) => ({
+            productId: `placeholder-${index}`,
+            productTitle: `Product ${index + 1}`,
+            complianceScore: 0,
+            violations: [],
+            status: "flagged",
+            market: scan.market,
+            shopDomain: scan.shopDomain,
+            originalDescription: "",
+            issues: [],
+          } as unknown as ComplianceFinding));
+
+      let index = 0;
+
+      const step = () => {
+        setCurrentProductIndex(index);
+        setProgress(Math.round(((index + 1) / total) * 100));
+        setProgressLabel(`Scanning ${results[index]?.productTitle ?? `product ${index + 1}`}`);
+        index += 1;
+        if (index < total) {
+          setTimeout(step, perProductDelay);
+        } else {
+          setTimeout(() => {
+            setProgress(100);
+            setProgressLabel("Finalizing scan…");
+            finalizeScan(scan, toastMessage);
+            setTimeout(() => {
+              setIsScanning(false);
+              setScanCompleteState("success");
+            }, 400);
+          }, perProductDelay);
+        }
+      };
+
+      step();
+    },
+    [finalizeScan],
+  );
+
+useEffect(() => {
+  if (runScanFetcher.state === "submitting" && runScanFetcher.formData?.get("intent") === "startScan") {
+    setIsScanning(true);
+    setScanCompleteState("idle");
+    setProgress(5);
+    setProgressLabel("Preparing scan…");
+    setTotalProducts(0);
+    setCurrentProductIndex(0);
+  }
+}, [runScanFetcher.state, runScanFetcher.formData]);
+
+useEffect(() => {
+  if (runScanFetcher.state === "idle") {
+    if (runScanFetcher.data?.scan && runScanFetcher.data.scan.id !== lastAnimatedScanId) {
+      setLastAnimatedScanId(runScanFetcher.data.scan.id);
+      animateScanProgress(runScanFetcher.data.scan, runScanFetcher.data.toast);
+    } else if (runScanFetcher.data?.error) {
+      setIsScanning(false);
+      setScanCompleteState("error");
+      triggerToast(runScanFetcher.data.error);
     }
-  }, [runScanFetcher.state, runScanFetcher.data, triggerToast]);
+  }
+}, [runScanFetcher.state, runScanFetcher.data, animateScanProgress, triggerToast, lastAnimatedScanId]);
 
   useEffect(() => {
     if (rescanFetcher.state === "idle" && rescanFetcher.data?.scan) {
@@ -371,6 +457,13 @@ export default function ComplianceDashboardPage() {
     },
     [triggerToast],
   );
+
+  const estimatedSecondsLeft = useMemo(() => {
+    if (!isScanning || !totalProducts) return null;
+    const remaining = Math.max(totalProducts - currentProductIndex - 1, 0);
+    const perProductSeconds = 0.5;
+    return Math.ceil(remaining * perProductSeconds);
+  }, [isScanning, totalProducts, currentProductIndex]);
 
   return (
     <Layout>
@@ -529,6 +622,54 @@ export default function ComplianceDashboardPage() {
             )}
           </Stack>
         </Card>
+      </Layout.Section>
+
+      <Layout.Section>
+        <AnimatePresence>
+          {isScanning && (
+            <motion.div
+              key="scan-progress"
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <Card>
+                <Stack vertical spacing="300">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text variant="bodyMd">{progressLabel}</Text>
+                    <Text tone="subdued">{progress}%</Text>
+                  </InlineStack>
+                  <ProgressBar progress={progress} size="small" tone="primary" animated />
+                  {totalProducts > 0 && (
+                    <InlineStack gap="200" blockAlign="center">
+                      <Text tone="subdued">
+                        Scanning product {Math.min(currentProductIndex + 1, totalProducts)} of {totalProducts}
+                      </Text>
+                      {estimatedSecondsLeft !== null && (
+                        <Text tone="subdued">Estimated time left {estimatedSecondsLeft}s</Text>
+                      )}
+                    </InlineStack>
+                  )}
+                </Stack>
+              </Card>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        {!isScanning && scanCompleteState === "success" && (
+          <motion.div
+            key="scan-success"
+            initial={{ opacity: 0, y: -5 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <Card subdued>
+              <InlineStack gap="200" blockAlign="center">
+                <Icon source={CheckCircleIcon} tone="success" />
+                <Text>Scan complete — results updated below.</Text>
+              </InlineStack>
+            </Card>
+          </motion.div>
+        )}
       </Layout.Section>
 
       <Layout.Section>
@@ -691,6 +832,14 @@ function ProductResultCard({
               <Text variant="headingSm" as="h3">
                 {result.productTitle}
               </Text>
+              {hasViolations && (
+                <InlineStack gap="100" blockAlign="center">
+                  <Icon source={AlertCircleIcon} tone="critical" />
+                  <Text tone="critical" variant="bodySm">
+                    Attention needed
+                  </Text>
+                </InlineStack>
+              )}
               <Text tone="subdued" as="p">
                 {shopDomain}
               </Text>
