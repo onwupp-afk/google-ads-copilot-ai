@@ -266,11 +266,19 @@ export async function fetchSchedules(shopDomain: string) {
 }
 
 export async function fetchHistory(shopDomain: string) {
-  return prisma.productScanHistory.findMany({
-    where: { shopDomain },
-    orderBy: { scannedAt: "asc" },
-    take: 1000,
-  });
+  try {
+    return await prisma.productScanHistory.findMany({
+      where: { shopDomain },
+      orderBy: { scannedAt: "asc" },
+      take: 1000,
+    });
+  } catch (error: any) {
+    if (error?.code === "P2022") {
+      console.warn("ProductScanHistory schema mismatch detected, falling back to empty history", error.message);
+      return [];
+    }
+    throw error;
+  }
 }
 
 export function serializeScan(scan: any) {
