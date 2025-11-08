@@ -76,13 +76,7 @@ type ProductHistoryPoint = {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  let dashboard;
-  try {
-    dashboard = await hydrateDashboard(session.shop);
-  } catch (error) {
-    console.error("Failed to hydrate compliance dashboard", error);
-    dashboard = await fallbackDashboard(session.shop);
-  }
+  const dashboard = await hydrateDashboard(session.shop);
   const shopRecord = await prisma.shop.findUnique({ where: { domain: session.shop } });
 
   const normalizedHistory = dashboard.history.map((entry) => ({
@@ -894,28 +888,4 @@ function formatRelative(value: string) {
   const hours = Math.round(mins / 60);
   if (hours < 24) return `${hours}h ago`;
   return `${Math.round(hours / 24)}d ago`;
-}
-
-async function fallbackDashboard(shopDomain: string) {
-  const scans = await prisma.scan.findMany({ where: { shopDomain }, orderBy: { startedAt: "desc" }, take: 5 });
-  const normalizedScans = scans.map((scan) => ({
-    ...scan,
-    startedAt: scan.startedAt.toISOString(),
-    completedAt: scan.completedAt ? scan.completedAt.toISOString() : null,
-    results: (scan.results as ComplianceFinding[] | null) ?? [],
-  }));
-
-  return {
-    scans: normalizedScans,
-    schedules: [],
-    history: [],
-    notifications: [],
-    aiConnected: false,
-  } satisfies {
-    scans: SerializedScan[];
-    schedules: any[];
-    history: ProductHistoryPoint[];
-    notifications: DashboardNotification[];
-    aiConnected: boolean;
-  };
 }
