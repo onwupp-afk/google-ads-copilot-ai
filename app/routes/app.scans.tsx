@@ -1,13 +1,16 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useFetcher, useLoaderData } from "@remix-run/react";
-import type { Scan } from "@prisma/client";
+import type { ProductScanHistory, Scan } from "@prisma/client";
 import {
+  ActionList,
   Badge,
   Banner,
   Button,
   Card,
+  Checkbox,
+  Collapsible,
   Divider,
   Icon,
   InlineStack,
@@ -16,13 +19,18 @@ import {
   Link,
   Modal,
   Pagination,
+  Popover,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
   Spinner,
   Text,
+  TextField,
+  Thumbnail,
+  Tooltip as PolarisTooltip,
 } from "@shopify/polaris";
 import { AlertCircleIcon, CheckCircleIcon, ProductIcon } from "@shopify/polaris-icons";
+import { Line, LineChart, ResponsiveContainer, Tooltip as RechartTooltip, XAxis, YAxis } from "recharts";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getPolicyRules, type PolicyRule } from "../data/policyKeywords";
@@ -41,6 +49,10 @@ const PRODUCTS_QUERY = `#graphql
         descriptionHtml
         onlineStoreUrl
         tags
+        featuredImage {
+          url
+          altText
+        }
         metafields(first: 10) {
           edges {
             node {
@@ -59,17 +71,49 @@ const PRODUCTS_QUERY = `#graphql
   }
 `;
 
-type ScanIntent = "startScan";
+const PRODUCT_BY_ID_QUERY = `#graphql
+  query ProductForScan($id: ID!) {
+    product(id: $id) {
+      id
+      legacyResourceId
+      title
+      handle
+      descriptionHtml
+      onlineStoreUrl
+      tags
+      featuredImage { url altText }
+      metafields(first: 10) {
+        edges {
+          node {
+            namespace
+            key
+            value
+          }
+        }
+      }
+    }
+  }
+`;
+
+type ScanIntent = "startScan" | "rescanProduct";
 
 export type ComplianceFinding = {
   productId: string;
   legacyResourceId?: string;
   productTitle: string;
+  productHandle?: string | null;
+  thumbnailUrl?: string | null;
+  originalDescription: string;
+  originalHtml?: string;
   market: string;
   shopDomain: string;
   violations: ComplianceViolation[];
   complianceScore: number;
   status: "flagged" | "clean";
+  aiRewrite?: {
+    title?: string;
+    description?: string;
+  };
 };
 
 export type ComplianceViolation = {
@@ -88,19 +132,37 @@ export type SerializedScan = Omit<Scan, "startedAt" | "completedAt" | "results">
   results: ComplianceFinding[];
 };
 
+export type SerializedProductHistory = Omit<ProductScanHistory, "createdAt"> & {
+  createdAt: string;
+};
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
 
-  const [scans, aiStatus] = await Promise.all([
+  const [scans, aiStatus, shopRecord, productHistory] = await Promise.all([
     prisma.scan.findMany({
       where: { shopDomain: session.shop },
       orderBy: { startedAt: "desc" },
       take: 5,
     }),
     testConnection(),
+    prisma.shop.findUnique({ where: { domain: session.shop } }),
+    prisma.productScanHistory.findMany({
+      where: { shopDomain: session.shop },
+      orderBy: { createdAt: "asc" },
+      take: 500,
+    }),
   ]);
 
-  return json({ scans: scans.map(serializeScan), aiConnected: Boolean(aiStatus) });
+  return json({
+    scans: scans.map(serializeScan),
+    aiConnected: Boolean(aiStatus),
+    plan: shopRecord?.plan ?? "free",
+    productHistory: productHistory.map((record) => ({
+      ...record,
+      createdAt: record.createdAt.toISOString(),
+    })),
+  });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -122,12 +184,70 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (intent === "rescanProduct") {
+    const productId = formData.get("productId")?.toString();
+    const scanId = formData.get("scanId")?.toString();
+    if (!productId || !scanId) {
+      return json({ error: "Missing product or scan" }, { status: 400 });
+    }
+
+    const scanRecord = await prisma.scan.findUnique({ where: { id: scanId } });
+    if (!scanRecord || scanRecord.shopDomain !== session.shop) {
+      return json({ error: "Scan not found" }, { status: 404 });
+    }
+
+    const product = await fetchProductById(admin, productId);
+    if (!product) {
+      return json({ error: "Product not found" }, { status: 404 });
+    }
+
+    const finding = await analyzeProduct({
+      product,
+      rules: getPolicyRules(scanRecord.market),
+      market: scanRecord.market,
+      openAiClient: openai,
+      shopDomain: session.shop,
+    });
+
+    const existingResults = (scanRecord.results as ComplianceFinding[] | undefined) ?? [];
+    const updatedResults = updateResultsArray(existingResults, finding);
+    const aggregate = buildAggregateMetrics(updatedResults);
+
+    const updatedScan = await prisma.scan.update({
+      where: { id: scanId },
+      data: {
+        results: updatedResults,
+        complianceScore: aggregate.complianceScore,
+        violations: aggregate.totalViolations,
+        productsScanned: updatedResults.length,
+        completedAt: new Date(),
+      },
+    });
+
+    await prisma.productScanHistory.create({
+      data: {
+        scanId,
+        shopDomain: session.shop,
+        productId: finding.productId,
+        productTitle: finding.productTitle,
+        market: scanRecord.market,
+        riskScore: calculateProductRisk(finding.violations),
+        violationsCount: finding.violations.length,
+        complianceScore: finding.complianceScore,
+      },
+    });
+
+    return json({ scan: serializeScan(updatedScan), rescanProductId: productId });
+  }
+
   return json({ error: "Unsupported action" }, { status: 400 });
 };
 
 export default function AppScansPage() {
-  const { scans, aiConnected } = useLoaderData<typeof loader>();
+  const { scans, aiConnected, plan, productHistory } = useLoaderData<typeof loader>();
   const runScanFetcher = useFetcher<typeof action>();
+  const rescanFetcher = useFetcher<typeof action>();
+  const applyFixFetcher = useFetcher();
 
   const [history, setHistory] = useState<SerializedScan[]>(scans);
   const [selectedScanId, setSelectedScanId] = useState<string | null>(scans[0]?.id ?? null);
@@ -135,6 +255,14 @@ export default function AppScansPage() {
   const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
+  const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
+  const [previewProduct, setPreviewProduct] = useState<ComplianceFinding | null>(null);
+  const [previewContent, setPreviewContent] = useState<string>("");
+  const [manualEditEnabled, setManualEditEnabled] = useState(false);
+  const [exportPopoverActive, setExportPopoverActive] = useState(false);
+  const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
+
+  const isFreePlan = !plan || plan === "free";
 
   useEffect(() => {
     if (runScanFetcher.state === "idle") {
@@ -149,13 +277,33 @@ export default function AppScansPage() {
     }
   }, [runScanFetcher.state, runScanFetcher.data]);
 
+  useEffect(() => {
+    if (rescanFetcher.state === "idle" && rescanFetcher.data?.scan) {
+      setHistory((prev) => {
+        const updated = prev.map((scan) => (scan.id === rescanFetcher.data.scan.id ? rescanFetcher.data.scan : scan));
+        return updated;
+      });
+    }
+  }, [rescanFetcher.state, rescanFetcher.data]);
+
+  useEffect(() => {
+    if (applyFixFetcher.state === "submitting") {
+      const productId = (applyFixFetcher.formData?.get("productId") as string) ?? null;
+      if (productId) {
+        setPendingApplyProductId(productId);
+      }
+    }
+    if (applyFixFetcher.state === "idle") {
+      setPendingApplyProductId(null);
+    }
+  }, [applyFixFetcher.state, applyFixFetcher.formData]);
+
   const displayedScan = useMemo(() => {
     if (!history.length) return undefined;
     if (!selectedScanId) return history[0];
     return history.find((scan) => scan.id === selectedScanId) ?? history[0];
   }, [history, selectedScanId]);
 
-  const isScanning = runScanFetcher.state !== "idle";
   const scanHistoryOptions = history.map((scan) => ({
     label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
     value: scan.id,
@@ -179,83 +327,97 @@ export default function AppScansPage() {
     return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
   }, [displayedScan, currentPage]);
 
-  const resultSections = visibleResults.map((result, resultIndex) => {
-    const hasViolations = result.violations.length > 0;
-    const summaryBadgeTone = hasViolations ? "critical" : "success";
+  const historyByProduct = useMemo(() => groupHistoryByProduct(productHistory), [productHistory]);
 
-    return (
-      <div key={`${result.productId}-section`}>
-        <Stack vertical spacing="300">
-          <InlineStack align="space-between" blockAlign="start">
-            <div>
-              <Text variant="headingSm" as="h3">
-                {result.productTitle}
-              </Text>
-              <Text tone="subdued" as="p">
-                {hasViolations
-                  ? `${result.violations.length} violation${result.violations.length === 1 ? "" : "s"} detected`
-                  : "No violations detected"}
-              </Text>
-            </div>
-            <Badge tone={summaryBadgeTone}>
-              {hasViolations ? "Flagged" : "Clean"}
-            </Badge>
-          </InlineStack>
+  const toggleExpanded = useCallback((productId: string) => {
+    setExpandedProducts((prev) => ({ ...prev, [productId]: !prev[productId] }));
+  }, []);
 
-          {hasViolations ? (
-            <Stack vertical spacing="200">
-              {result.violations.map((violation, index) => (
-                <div key={`${result.productId}-violation-${index}`}>
-                  <InlineStack gap="200" align="space-between">
-                    <InlineStack gap="200" blockAlign="center">
-                      <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
-                      <Badge tone={riskTone(violation.riskScore)}>
-                        Risk {formatRisk(violation.riskScore)}
-                      </Badge>
-                    </InlineStack>
-                    {violation.sourceUrl && (
-                      <Link url={violation.sourceUrl} target="_blank">
-                        Policy reference
-                      </Link>
-                    )}
-                  </InlineStack>
-                  <Text variant="bodySm" as="p">
-                    <strong>{violation.policy}</strong> · {violation.law}
-                  </Text>
-                  <Text variant="bodySm" tone="subdued" as="p">
-                    {violation.issue}
-                  </Text>
-                  <Text variant="bodySm" as="p">
-                    <strong>AI guidance:</strong> {violation.suggestion}
-                  </Text>
-                  {index < result.violations.length - 1 && <Divider />}
-                </div>
-              ))}
-            </Stack>
-          ) : (
-            <Text tone="subdued">Everything looks compliant for this product.</Text>
-          )}
-        </Stack>
-        {resultIndex < visibleResults.length - 1 && <Divider />}
-      </div>
-    );
-  });
+  const handlePreview = useCallback((result: ComplianceFinding) => {
+    setPreviewProduct(result);
+    setPreviewContent(result.aiRewrite?.description ?? result.originalDescription);
+    setManualEditEnabled(false);
+  }, []);
+
+  const handleApplyFix = useCallback(
+    (product: ComplianceFinding, usePreviewContent = false) => {
+      const description = usePreviewContent
+        ? previewContent
+        : product.aiRewrite?.description ?? product.originalDescription;
+      applyFixFetcher.submit(
+        { productId: product.productId, description },
+        { method: "post", action: "/api/scan/apply" },
+      );
+    },
+    [applyFixFetcher, previewContent],
+  );
+
+  const handleExport = useCallback(
+    (format: "csv" | "pdf") => {
+      if (!displayedScan || !selectedScanId || typeof window === "undefined") return;
+      const url = new URL(`/api/scan/export`, window.location.origin);
+      url.searchParams.set("scanId", selectedScanId);
+      url.searchParams.set("market", displayedScan.market);
+      url.searchParams.set("format", format);
+      window.open(url.toString(), "_blank");
+      setExportPopoverActive(false);
+    },
+    [displayedScan, selectedScanId],
+  );
+
+  const exportButton = (
+    <Button
+      disclosure
+      onClick={() => setExportPopoverActive((prev) => !prev)}
+      disabled={!displayedScan || isFreePlan}
+    >
+      Export Results
+    </Button>
+  );
+
+  const exportActivator = isFreePlan ? (
+    <PolarisTooltip content="Upgrade required" dismissOnMouseOut>
+      <span>{exportButton}</span>
+    </PolarisTooltip>
+  ) : (
+    exportButton
+  );
+
+  const exportPopover = (
+    <Popover
+      active={exportPopoverActive && !isFreePlan && Boolean(displayedScan)}
+      onClose={() => setExportPopoverActive(false)}
+      activator={exportActivator}
+    >
+      <ActionList
+        items={[
+          { content: "Export CSV", onAction: () => handleExport("csv") },
+          { content: "Export PDF", onAction: () => handleExport("pdf") },
+        ]}
+      />
+    </Popover>
+  );
 
   return (
     <>
       <Layout>
         <Layout.Section>
-          <Text variant="headingLg" as="h1">
-            AI Compliance Scan
-          </Text>
-          <Text tone="subdued" as="p">
-            Scan your catalog for Google Ads and market-specific regulations. Every issue now includes the policy, governing law, severity level, and a risk score so you can justify remediation work immediately.
-          </Text>
+          <InlineStack align="space-between" blockAlign="center">
+            <div>
+              <Text variant="headingLg" as="h1">
+                Compliance Intelligence Dashboard
+              </Text>
+              <Text tone="subdued" as="p">
+                Deep dive into every policy flag with market-specific citations, severity scores, and AI remediation workflows.
+              </Text>
+            </div>
+            {exportPopover}
+          </InlineStack>
         </Layout.Section>
 
         <Layout.Section>
           <Banner status="info">
-            This AI-powered scan stays in sync with the latest Google Ads and local law updates. Each violation references the governing rule so your team can document decisions quickly.
+            This AI-powered scan stays up to date with Google Ads and local law updates. Each result documents the policy, law, and risk level so your team can justify decisions quickly.
           </Banner>
         </Layout.Section>
 
@@ -269,7 +431,7 @@ export default function AppScansPage() {
                 onChange={(value) => setMarket(value)}
               />
               <Text as="p" tone="subdued">
-                We localize each scan to the selected market so policy citations and risk scoring reflect current laws.
+                We localize each scan to the selected market so policy citations and risk scoring reflect current regulations.
               </Text>
               {history.length > 0 && (
                 <Select
@@ -333,8 +495,8 @@ export default function AppScansPage() {
               <runScanFetcher.Form method="post">
                 <input type="hidden" name="intent" value="startScan" />
                 <input type="hidden" name="market" value={market} />
-                <Button primary submit disabled={isScanning}>
-                  {isScanning ? (
+                <Button primary submit disabled={runScanFetcher.state !== "idle"}>
+                  {runScanFetcher.state !== "idle" ? (
                     <InlineStack gap="200" blockAlign="center">
                       <Spinner size="small" />
                       <span>Scanning…</span>
@@ -350,7 +512,7 @@ export default function AppScansPage() {
                 </Text>
               )}
             </InlineStack>
-            {isScanning && (
+            {runScanFetcher.state !== "idle" && (
               <div style={{ marginTop: "var(--p-space-400)" }}>
                 <SkeletonDisplayText size="small" />
                 <SkeletonBodyText lines={3} />
@@ -371,41 +533,63 @@ export default function AppScansPage() {
           <Layout.Section>
             <Card>
               <Stack spacing="400">
-                <div>
-                  <Text variant="headingLg" as="h2">
-                    Scan Results
-                  </Text>
-                  <Text as="p" tone="subdued">
-                    Every violation includes the Google Ads policy, local law reference, severity badge, and AI remediation note.
-                  </Text>
-                </div>
-                <Divider />
                 <InlineStack align="space-between" blockAlign="center">
-                  <InlineStack gap="200" blockAlign="center">
-                    <Button onClick={() => setUpgradeModalOpen(true)}>Apply All AI Suggestions</Button>
-                    <Text as="span" tone="subdued">
-                      Upgrade required for automatic remediation.
+                  <div>
+                    <Text variant="headingLg" as="h2">
+                      Scan Results
                     </Text>
+                    <Text as="p" tone="subdued">
+                      Every violation includes Google Ads policy context, local law references, severity, and AI remediation.
+                    </Text>
+                  </div>
+                  <InlineStack gap="200" blockAlign="center">
+                    {isFreePlan ? (
+                      <PolarisTooltip content="Upgrade required" dismissOnMouseOut>
+                        <Button disabled>Apply All AI Suggestions</Button>
+                      </PolarisTooltip>
+                    ) : (
+                      <Button onClick={() => setUpgradeModalOpen(true)}>Apply All AI Suggestions</Button>
+                    )}
+                    {displayedScan.results.length > RESULTS_PER_PAGE && (
+                      <InlineStack gap="200" blockAlign="center">
+                        <Pagination
+                          hasPrevious={currentPage > 0}
+                          onPrevious={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
+                          hasNext={currentPage < totalPages - 1}
+                          onNext={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
+                        />
+                        <Text tone="subdued">
+                          Page {currentPage + 1} of {totalPages}
+                        </Text>
+                      </InlineStack>
+                    )}
                   </InlineStack>
-                  {displayedScan.results.length > RESULTS_PER_PAGE && (
-                    <InlineStack gap="200" blockAlign="center">
-                      <Pagination
-                        hasPrevious={currentPage > 0}
-                        onPrevious={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
-                        hasNext={currentPage < totalPages - 1}
-                        onNext={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
-                      />
-                      <Text tone="subdued">
-                        Page {currentPage + 1} of {totalPages}
-                      </Text>
-                    </InlineStack>
-                  )}
                 </InlineStack>
+
                 {visibleResults.length === 0 ? (
                   <Text tone="subdued">No products matched this page.</Text>
                 ) : (
                   <Stack vertical spacing="400">
-                    {resultSections}
+                    {visibleResults.map((result) => (
+                      <ProductResultCard
+                        key={result.productId}
+                        result={result}
+                        history={historyByProduct[result.productId] ?? []}
+                        expanded={Boolean(expandedProducts[result.productId])}
+                        toggleExpanded={() => toggleExpanded(result.productId)}
+                        onPreview={() => handlePreview(result)}
+                        onFix={() => handleApplyFix(result)}
+                        onRescan={() => {
+                          if (!displayedScan) return;
+                          const formData = new FormData();
+                          formData.append("intent", "rescanProduct");
+                          formData.append("productId", result.productId);
+                          formData.append("scanId", displayedScan.id);
+                          rescanFetcher.submit(formData, { method: "post" });
+                        }}
+                        applying={pendingApplyProductId === result.productId && applyFixFetcher.state !== "idle"}
+                      />
+                    ))}
                   </Stack>
                 )}
               </Stack>
@@ -435,6 +619,53 @@ export default function AppScansPage() {
           </Text>
         </Modal.Section>
       </Modal>
+
+      <Modal
+        open={Boolean(previewProduct)}
+        onClose={() => setPreviewProduct(null)}
+        title={previewProduct ? `AI Preview — ${previewProduct.productTitle}` : "AI Preview"}
+        large
+        primaryAction={{
+          content: "Apply Fix",
+          disabled: !previewProduct,
+          onAction: () => {
+            if (!previewProduct) return;
+            handleApplyFix(previewProduct, true);
+            setPreviewProduct(null);
+          },
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setPreviewProduct(null) }]}
+      >
+        <Modal.Section>
+          {previewProduct ? (
+            <Stack vertical spacing="400">
+              <Card title="Original copy">
+                <Text as="p" tone="subdued">
+                  {previewProduct.originalDescription}
+                </Text>
+              </Card>
+              <Card title="AI rewrite">
+                <Stack vertical spacing="300">
+                  <Checkbox
+                    label="Allow manual edits"
+                    checked={manualEditEnabled}
+                    onChange={(value) => setManualEditEnabled(value)}
+                  />
+                  <TextField
+                    value={previewContent}
+                    onChange={setPreviewContent}
+                    multiline
+                    autoComplete="off"
+                    disabled={!manualEditEnabled}
+                  />
+                </Stack>
+              </Card>
+            </Stack>
+          ) : (
+            <Text tone="subdued">Select a product to preview AI fixes.</Text>
+          )}
+        </Modal.Section>
+      </Modal>
     </>
   );
 }
@@ -447,17 +678,156 @@ const MARKETS = [
   { label: "Canada", value: "ca" },
 ];
 
+function ProductResultCard({
+  result,
+  history,
+  expanded,
+  toggleExpanded,
+  onPreview,
+  onFix,
+  onRescan,
+  applying,
+}: {
+  result: ComplianceFinding;
+  history: SerializedProductHistory[];
+  expanded: boolean;
+  toggleExpanded: () => void;
+  onPreview: () => void;
+  onFix: () => void;
+  onRescan: () => void;
+  applying: boolean;
+}) {
+  const hasViolations = result.violations.length > 0;
+  const highestSeverity = getHighestSeverity(result.violations);
+  const summaryBadgeTone = hasViolations ? severityTone(highestSeverity) : "success";
+  const summaryLabel = hasViolations ? `⚠️ ${result.violations.length} flagged` : "✅ Clean";
+
+  const historyData = history.map((entry) => ({
+    date: new Date(entry.createdAt).toLocaleDateString(),
+    complianceScore: entry.complianceScore,
+  }));
+
+  return (
+    <Card>
+      <Card.Header
+        title={result.productTitle}
+        actions={[{ content: expanded ? "Hide details" : "Show details", onAction: toggleExpanded }]}
+      />
+      <Card.Section>
+        <Stack spacing="400" alignment="center">
+          <Thumbnail source={result.thumbnailUrl ?? ProductIcon} alt={result.productTitle} size="large" />
+          <div style={{ flex: 1 }}>
+            <InlineStack gap="200" blockAlign="center">
+              <Badge tone={summaryBadgeTone}>{summaryLabel}</Badge>
+              <Badge tone="info">Score {result.complianceScore}%</Badge>
+            </InlineStack>
+            <Text as="p" tone="subdued">
+              {hasViolations
+                ? `${highestSeverity} severity · ${formatRisk(calculateProductRisk(result.violations))} risk`
+                : "No violations detected in this market."}
+            </Text>
+          </div>
+          <div style={{ flexBasis: "220px", height: 120 }}>
+            <ProductHistorySparkline data={historyData} />
+          </div>
+        </Stack>
+      </Card.Section>
+      <Card.Section subdued>
+        <div style={{ display: "flex", gap: "var(--p-space-200)", flexWrap: "wrap" }}>
+          <Button size="slim" onClick={onFix} disabled={!result.aiRewrite}>
+            {applying ? (
+              <InlineStack gap="100" blockAlign="center">
+                <Spinner size="small" />
+                <span>Fixing…</span>
+              </InlineStack>
+            ) : (
+              "Fix with AI"
+            )}
+          </Button>
+          <Button size="slim" onClick={onPreview} disabled={!result.aiRewrite}>
+            Preview Fix
+          </Button>
+          <Button size="slim" onClick={onRescan}>
+            {result.status === "flagged" ? "Rescan Product" : "Audit Again"}
+          </Button>
+        </div>
+      </Card.Section>
+      <Card.Section>
+        <Collapsible open={expanded} id={`${result.productId}-details`}>
+          <Stack vertical spacing="300">
+            {hasViolations ? (
+              result.violations.map((violation, index) => (
+                <div key={`${result.productId}-violation-${index}`}>
+                  <InlineStack align="space-between" blockAlign="center">
+                    <InlineStack gap="200" blockAlign="center">
+                      <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
+                      <Badge tone={riskTone(violation.riskScore)}>
+                        Risk {formatRisk(violation.riskScore)}
+                      </Badge>
+                    </InlineStack>
+                    {violation.sourceUrl && (
+                      <Link url={violation.sourceUrl} target="_blank">
+                        View policy reference
+                      </Link>
+                    )}
+                  </InlineStack>
+                  <Text variant="bodySm" as="p">
+                    <strong>{violation.policy}</strong> · {violation.law}
+                  </Text>
+                  <Text variant="bodySm" tone="subdued" as="p">
+                    {violation.issue}
+                  </Text>
+                  <Text variant="bodySm" as="p">
+                    <strong>AI guidance:</strong> {violation.suggestion}
+                  </Text>
+                  {index < result.violations.length - 1 && <Divider />}
+                </div>
+              ))
+            ) : (
+              <Text tone="subdued">Everything looks compliant for this product.</Text>
+            )}
+          </Stack>
+        </Collapsible>
+      </Card.Section>
+    </Card>
+  );
+}
+
+function ProductHistorySparkline({ data }: { data: { date: string; complianceScore: number }[] }) {
+  if (data.length < 2) {
+    return (
+      <div style={{ display: "flex", height: "100%", alignItems: "center", justifyContent: "center" }}>
+        <Text tone="subdued" as="span">
+          Not enough data
+        </Text>
+      </div>
+    );
+  }
+
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={data} margin={{ top: 10, right: 0, left: 0, bottom: 0 }}>
+        <XAxis dataKey="date" hide />
+        <YAxis domain={[0, 100]} hide />
+        <RechartTooltip formatter={(value) => `${value}%`} labelFormatter={(label) => `Scan: ${label}`} />
+        <Line type="monotone" dataKey="complianceScore" stroke="#5c6ac4" strokeWidth={2} dot={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
 function formatTimestamp(value: string) {
   return new Date(value).toLocaleString();
 }
 
 function serializeScan(scan: Scan): SerializedScan {
-  const rawResults = (scan.results as ComplianceFinding[] | undefined) ?? [];
   return {
     ...scan,
     startedAt: scan.startedAt.toISOString(),
     completedAt: scan.completedAt ? scan.completedAt.toISOString() : null,
-    results: rawResults.map((raw) => normalizeFinding(raw, { market: scan.market, shopDomain: scan.shopDomain })),
+    results: ((scan.results as ComplianceFinding[] | null) ?? []).map((raw) =>
+      normalizeFinding(raw, { market: scan.market, shopDomain: scan.shopDomain }),
+    ),
   };
 }
 
@@ -486,22 +856,32 @@ async function runComplianceScan({ admin, session, market }: { admin: any; sessi
     results.push(finding);
   }
 
-  const violationCount = results.reduce((sum, result) => sum + result.violations.length, 0);
-  const complianceScore = results.length
-    ? Math.round(results.reduce((sum, r) => sum + r.complianceScore, 0) / results.length)
-    : 100;
+  const aggregate = buildAggregateMetrics(results);
 
   const saved = await prisma.scan.create({
     data: {
       shopDomain: session.shop,
       market,
-      complianceScore,
-      violations: violationCount,
+      complianceScore: aggregate.complianceScore,
+      violations: aggregate.totalViolations,
       productsScanned: results.length,
       status: "complete",
       completedAt: new Date(),
       results,
     },
+  });
+
+  await prisma.productScanHistory.createMany({
+    data: results.map((result) => ({
+      scanId: saved.id,
+      shopDomain: session.shop,
+      productId: result.productId,
+      productTitle: result.productTitle,
+      market,
+      riskScore: calculateProductRisk(result.violations),
+      violationsCount: result.violations.length,
+      complianceScore: result.complianceScore,
+    })),
   });
 
   return saved;
@@ -523,6 +903,12 @@ async function fetchAllProducts(admin: any, batchSize = 50) {
   }
 
   return products;
+}
+
+async function fetchProductById(admin: any, productId: string) {
+  const response = await admin.graphql(PRODUCT_BY_ID_QUERY, { variables: { id: productId } });
+  const body = await response.json();
+  return body?.data?.product ?? null;
 }
 
 async function analyzeProduct({
@@ -547,7 +933,7 @@ async function analyzeProduct({
   const matches = detectPolicyMatches(combined, rules);
   const heuristicViolations = buildHeuristicViolations(matches, market, product.title);
 
-  const aiViolations = await buildAiViolations({
+  const aiAnalysis = await buildAiAnalysis({
     openAiClient,
     market,
     productTitle: product.title,
@@ -556,18 +942,23 @@ async function analyzeProduct({
     policyHints: heuristicViolations.map((violation) => `${violation.policy}: ${violation.issue}`),
   });
 
-  const combinedViolations = dedupeViolations([...heuristicViolations, ...aiViolations]);
+  const combinedViolations = dedupeViolations([...heuristicViolations, ...aiAnalysis.violations]);
   const complianceScore = calculateComplianceScore(combinedViolations);
 
   return {
     productId: product.id,
     legacyResourceId: product.legacyResourceId?.toString(),
     productTitle: product.title,
+    productHandle: product.handle,
+    thumbnailUrl: product.featuredImage?.url ?? null,
+    originalDescription: plainDescription,
+    originalHtml: product.descriptionHtml ?? undefined,
     market,
     shopDomain,
     violations: combinedViolations,
     complianceScore,
     status: combinedViolations.length ? "flagged" : "clean",
+    aiRewrite: aiAnalysis.rewrite,
   };
 }
 
@@ -602,7 +993,7 @@ function buildHeuristicViolations(
   });
 }
 
-async function buildAiViolations({
+async function buildAiAnalysis({
   openAiClient,
   market,
   productTitle,
@@ -616,8 +1007,8 @@ async function buildAiViolations({
   description: string;
   url?: string | null;
   policyHints: string[];
-}): Promise<ComplianceViolation[]> {
-  if (!openAiClient) return [];
+}): Promise<{ violations: ComplianceViolation[]; rewrite?: { title?: string; description?: string } }> {
+  if (!openAiClient) return { violations: [] };
 
   const lawReference = getMarketLawReference(market);
   const truncatedDescription = description.slice(0, 3500);
@@ -642,23 +1033,27 @@ Product title: ${productTitle}
 Product description: ${truncatedDescription}
 Product URL: ${url ?? "N/A"}
 Known heuristic flags: ${hints || "None"}
-Return JSON {"violations":[{"issue":"","policy":"","law":"","severity":"High|Medium|Low","riskScore":0-1,"suggestion":"","sourceUrl":""}]}.` ,
+Return JSON {"violations":[{"issue":"","policy":"","law":"","severity":"High|Medium|Low","riskScore":0-1,"suggestion":"","sourceUrl":""}],"rewrite":{"title":"","description":""}}.`,
         },
       ],
     });
 
     const content = completion.choices?.[0]?.message?.content;
-    if (!content) return [];
+    if (!content) return { violations: [] };
     const parsed = JSON.parse(content);
-    if (Array.isArray(parsed.violations)) {
-      return parsed.violations
-        .map((violation: any) => normalizeViolation(violation, market))
-        .filter((violation): violation is ComplianceViolation => Boolean(violation.issue));
-    }
-    return [];
+    const violations = Array.isArray(parsed.violations)
+      ? parsed.violations
+          .map((violation: any) => normalizeViolation(violation, market))
+          .filter((violation): violation is ComplianceViolation => Boolean(violation.issue))
+      : [];
+
+    return {
+      violations,
+      rewrite: parsed.rewrite,
+    };
   } catch (error) {
     console.error("OpenAI violation generation failed", error);
-    return [];
+    return { violations: [] };
   }
 }
 
@@ -678,6 +1073,13 @@ function calculateComplianceScore(violations: ComplianceViolation[]) {
   return Math.max(0, Math.round(100 - penalty));
 }
 
+function calculateProductRisk(violations: ComplianceViolation[]) {
+  if (!violations.length) return 0;
+  return clampRiskScore(
+    violations.reduce((sum, violation) => sum + violation.riskScore, 0) / violations.length,
+  );
+}
+
 function normalizeFinding(raw: any, fallback: { market: string; shopDomain: string }): ComplianceFinding {
   const productId = raw?.productId ?? raw?.id ?? "unknown";
   const market = raw?.market ?? fallback.market;
@@ -691,12 +1093,17 @@ function normalizeFinding(raw: any, fallback: { market: string; shopDomain: stri
     productId,
     legacyResourceId: raw?.legacyResourceId ?? undefined,
     productTitle: raw?.productTitle ?? raw?.title ?? "Untitled product",
+    productHandle: raw?.productHandle,
+    thumbnailUrl: raw?.thumbnailUrl ?? null,
+    originalDescription: raw?.originalDescription ?? "",
+    originalHtml: raw?.originalHtml,
     market,
     shopDomain: raw?.shopDomain ?? fallback.shopDomain,
     violations,
     complianceScore:
       typeof raw?.complianceScore === "number" ? raw.complianceScore : calculateComplianceScore(violations),
     status: raw?.status ?? (violations.length ? "flagged" : "clean"),
+    aiRewrite: raw?.aiRewrite,
   };
 }
 
@@ -814,6 +1221,42 @@ const MARKET_LAW_REFERENCES: Record<string, { law: string; url?: string }> = {
 
 function stripHtml(raw: string) {
   return raw.replace(/<[^>]*>?/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function getHighestSeverity(violations: ComplianceViolation[]): ComplianceViolation["severity"] {
+  if (!violations.length) return "Low";
+  if (violations.some((violation) => violation.severity === "High")) return "High";
+  if (violations.some((violation) => violation.severity === "Medium")) return "Medium";
+  return "Low";
+}
+
+function groupHistoryByProduct(records: SerializedProductHistory[]) {
+  return records.reduce<Record<string, SerializedProductHistory[]>>((acc, record) => {
+    if (!acc[record.productId]) {
+      acc[record.productId] = [];
+    }
+    acc[record.productId].push(record);
+    return acc;
+  }, {});
+}
+
+function updateResultsArray(results: ComplianceFinding[], finding: ComplianceFinding) {
+  const exists = results.find((result) => result.productId === finding.productId);
+  if (exists) {
+    return results.map((result) => (result.productId === finding.productId ? finding : result));
+  }
+  return [...results, finding];
+}
+
+function buildAggregateMetrics(results: ComplianceFinding[]) {
+  if (!results.length) {
+    return { complianceScore: 0, totalViolations: 0 };
+  }
+  const complianceScore = Math.round(
+    results.reduce((sum, result) => sum + (result.complianceScore ?? 0), 0) / results.length,
+  );
+  const totalViolations = results.reduce((sum, result) => sum + result.violations.length, 0);
+  return { complianceScore, totalViolations };
 }
 
 function getMetricCards(metrics: ReturnType<typeof buildMetrics>) {

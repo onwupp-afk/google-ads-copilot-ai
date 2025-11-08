@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_DATABASE_URL")
 }
 
@@ -29,25 +29,25 @@ model Session {
 }
 
 model Shop {
+  id        String   @id @default(uuid()) @db.Uuid
   domain    String   @unique
   plan      String?
   country   String?
   currency  String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  id        String   @id @default(uuid()) @db.Uuid
 }
 
 model Scan {
-  id             String   @id @default(cuid())
-  shopDomain     String
-  market         String
-  status         String   @default("running")
-  startedAt      DateTime @default(now())
-  completedAt    DateTime?
+  id              String    @id @default(cuid())
+  market          String
+  status          String    @default("running")
+  createdAt       DateTime  @default(now())
+  completedAt     DateTime?
   complianceScore Float?
-  violations     Int      @default(0)
-  productsScanned Int     @default(0)
-  results        Json?
-  createdAt      DateTime @default(now())
+  productsScanned Int       @default(0)
+  results         Json?
+  shopDomain      String
+  startedAt       DateTime  @default(now())
+  violations      Int       @default(0)
 }
