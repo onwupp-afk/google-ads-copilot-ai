@@ -1,178 +1,251 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useEffect, useMemo, useState } from "react";
-import { useFetcher, useLoaderData } from "@remix-run/react";
-import type { Scan } from "@prisma/client";
 import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import {
+  useFetcher,
+  useLoaderData,
+} from "@remix-run/react";
+import { Toast } from "@shopify/app-bridge/actions";
+import { useAppBridge } from "@shopify/app-bridge-react";
+import {
+  ActionList,
   Badge,
   Banner,
+  Box,
   Button,
+  ButtonGroup,
   Card,
-  DataTable,
+  Checkbox,
   Divider,
   Icon,
+  InlineGrid,
   InlineStack,
   Layout,
   LegacyStack as Stack,
   Link,
   Modal,
-  Pagination,
+  Popover,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
   Spinner,
   Text,
+  TextField,
+  Tooltip as PolarisTooltip,
 } from "@shopify/polaris";
-import { AlertCircleIcon, CheckCircleIcon, ProductIcon } from "@shopify/polaris-icons";
+import {
+  AlertCircleIcon,
+  CalendarCheckIcon,
+  CheckCircleIcon,
+  NotificationIcon,
+  ProductIcon,
+  RefreshIcon,
+} from "@shopify/polaris-icons";
+import {
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip as RechartsTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
-import { getPolicyRules, type PolicyRule } from "../data/policyKeywords";
-import { openai, testConnection } from "../utils/openai.server";
+import {
+  hydrateDashboard,
+  runFullScan,
+  rescanSingleProduct,
+  saveScanSchedule,
+  type ComplianceFinding,
+  type DashboardNotification,
+  type SerializedScan,
+} from "../models/scan.server";
 
 const RESULTS_PER_PAGE = 25;
 
-const PRODUCTS_QUERY = `#graphql
-  query ScanProducts($first: Int!, $after: String) {
-    products(first: $first, after: $after, sortKey: UPDATED_AT) {
-      nodes {
-        id
-        legacyResourceId
-        title
-        handle
-        descriptionHtml
-        onlineStoreUrl
-        tags
-        metafields(first: 10) {
-          edges {
-            node {
-              namespace
-              key
-              value
-            }
-          }
-        }
-      }
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-    }
-  }
-`;
-
-type ScanIntent = "startScan";
-
-export type ComplianceFinding = {
+type ProductHistoryPoint = {
   productId: string;
-  legacyResourceId?: string;
-  productTitle: string;
-  market: string;
-  shopDomain: string;
-  violations: ComplianceViolation[];
+  scannedAt: string;
   complianceScore: number;
-  status: "flagged" | "clean";
-};
-
-export type ComplianceViolation = {
-  issue: string;
-  policy: string;
-  law: string;
-  severity: "High" | "Medium" | "Low";
-  riskScore: number;
-  suggestion: string;
-  sourceUrl?: string;
-};
-
-export type SerializedScan = Omit<Scan, "startedAt" | "completedAt" | "results"> & {
-  startedAt: string;
-  completedAt: string | null;
-  results: ComplianceFinding[];
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
+  const dashboard = await hydrateDashboard(session.shop);
+  const shopRecord = await prisma.shop.findUnique({ where: { domain: session.shop } });
 
-  const [scans, aiStatus] = await Promise.all([
-    prisma.scan.findMany({
-      where: { shopDomain: session.shop },
-      orderBy: { startedAt: "desc" },
-      take: 5,
-    }),
-    testConnection(),
-  ]);
+  const normalizedHistory = dashboard.history.map((entry) => ({
+    ...entry,
+    scannedAt: entry.scannedAt instanceof Date ? entry.scannedAt.toISOString() : entry.scannedAt,
+  }));
 
-  return json({ scans: scans.map(serializeScan), aiConnected: Boolean(aiStatus) });
+  const normalizedSchedules = dashboard.schedules.map((schedule) => ({
+    ...schedule,
+    nextRun: schedule.nextRun ? schedule.nextRun.toISOString() : null,
+    lastRun: schedule.lastRun ? schedule.lastRun.toISOString() : null,
+  }));
+
+  return json({
+    scans: dashboard.scans,
+    notifications: dashboard.notifications,
+    aiConnected: dashboard.aiConnected,
+    schedules: normalizedSchedules,
+    history: normalizedHistory,
+    plan: shopRecord?.plan ?? "free",
+    shop: session.shop,
+  });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
-  const intent = formData.get("intent")?.toString() as ScanIntent | undefined;
+  const intent = formData.get("intent")?.toString();
   const market = (formData.get("market")?.toString() ?? "uk").toLowerCase();
+  const productId = formData.get("productId")?.toString();
+  const scanId = formData.get("scanId")?.toString();
+  const frequency = formData.get("frequency")?.toString() as
+    | "daily"
+    | "weekly"
+    | "monthly"
+    | undefined;
+
   const { admin, session } = await authenticate.admin(request);
 
-  if (intent === "startScan") {
-    try {
-      const scan = await runComplianceScan({ admin, session, market });
-      return json({ scan: serializeScan(scan) });
-    } catch (error) {
-      console.error("AI scan failed", error);
-      return json(
-        { error: error instanceof Error ? error.message : "Scan failed" },
-        { status: 500 },
-      );
+  try {
+    switch (intent) {
+      case "startScan": {
+        const scan = await runFullScan({ admin, shopDomain: session.shop, market });
+        return json({ scan, toast: "Scan complete" });
+      }
+      case "rescanProduct": {
+        if (!scanId || !productId) {
+          throw new Error("Missing scan or product");
+        }
+        const scan = await rescanSingleProduct({ admin, scanId, productId, shopDomain: session.shop });
+        return json({ scan, rescanProductId: productId, toast: "Product rescanned" });
+      }
+      case "scheduleProduct": {
+        if (!productId || !frequency) {
+          throw new Error("Missing schedule data");
+        }
+        const schedule = await saveScanSchedule({
+          shopDomain: session.shop,
+          productId,
+          market,
+          frequency,
+        });
+        return json({ schedule, toast: "Rescan schedule saved" });
+      }
+      default:
+        return json({ error: "Unsupported action" }, { status: 400 });
     }
+  } catch (error) {
+    return json(
+      {
+        error: error instanceof Error ? error.message : "Request failed",
+      },
+      { status: 500 },
+    );
   }
-
-  return json({ error: "Unsupported action" }, { status: 400 });
 };
 
-export default function AppScansPage() {
-  const { scans, aiConnected } = useLoaderData<typeof loader>();
-  const runScanFetcher = useFetcher<typeof action>();
-
-  const [history, setHistory] = useState<SerializedScan[]>(scans);
+export default function ComplianceDashboardPage() {
+  const { scans, schedules, history, notifications, aiConnected, plan, shop } = useLoaderData<typeof loader>();
+  const [scanHistory, setScanHistory] = useState(scans);
   const [selectedScanId, setSelectedScanId] = useState<string | null>(scans[0]?.id ?? null);
-  const [market, setMarket] = useState<string>("uk");
-  const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
-  const [scanError, setScanError] = useState<string | null>(null);
+  const [market, setMarket] = useState<string>(((scans[0]?.market as string) ?? "uk").toLowerCase());
   const [currentPage, setCurrentPage] = useState(0);
+  const [previewProduct, setPreviewProduct] = useState<ComplianceFinding | null>(null);
+  const [previewContent, setPreviewContent] = useState("" );
+  const [manualEditEnabled, setManualEditEnabled] = useState(false);
+  const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
+  const [notificationPopoverOpen, setNotificationPopoverOpen] = useState(false);
+  const [exportPopoverActive, setExportPopoverActive] = useState(false);
+  const [scheduleState, setScheduleState] = useState(schedules);
+  const [localHistory, setLocalHistory] = useState(history);
+  const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
+  const [bulkApplying, setBulkApplying] = useState(false);
 
-  useEffect(() => {
-    if (runScanFetcher.state === "idle") {
-      if (runScanFetcher.data?.scan) {
-        setHistory((prev) => [runScanFetcher.data.scan, ...prev].slice(0, 5));
-        setSelectedScanId(runScanFetcher.data.scan.id);
-        setCurrentPage(0);
-        setScanError(null);
-      } else if (runScanFetcher.data?.error) {
-        setScanError(runScanFetcher.data.error as string);
-      }
-    }
-  }, [runScanFetcher.state, runScanFetcher.data]);
+  const appBridge = useAppBridge();
+
+  const runScanFetcher = useFetcher<typeof action>();
+  const rescanFetcher = useFetcher<typeof action>();
+  const scheduleFetcher = useFetcher<typeof action>();
+  const applyFixFetcher = useFetcher();
+
+  const isFreePlan = !plan || plan === "free";
+
+  const shopNotifications = notifications;
 
   const displayedScan = useMemo(() => {
-    if (!history.length) return undefined;
-    if (!selectedScanId) return history[0];
-    return history.find((scan) => scan.id === selectedScanId) ?? history[0];
-  }, [history, selectedScanId]);
+    if (!scanHistory.length) return undefined;
+    if (!selectedScanId) return scanHistory[0];
+    return scanHistory.find((scan) => scan.id === selectedScanId) ?? scanHistory[0];
+  }, [scanHistory, selectedScanId]);
 
-  const isScanning = runScanFetcher.state !== "idle";
-  const scanHistoryOptions = history.map((scan) => ({
-    label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
-    value: scan.id,
-  }));
+  useEffect(() => {
+    if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
+      setScanHistory((prev) => [runScanFetcher.data!.scan, ...prev].slice(0, 5));
+      setSelectedScanId(runScanFetcher.data.scan.id);
+      setCurrentPage(0);
+      setLocalHistory((prev) => [
+        ...prev,
+        ...runScanFetcher.data!.scan.results.map((result) => ({
+          productId: result.productId,
+          scannedAt: new Date().toISOString(),
+          complianceScore: result.complianceScore ?? 0,
+        })),
+      ]);
+      triggerToast(runScanFetcher.data.toast);
+    }
+  }, [runScanFetcher.state, runScanFetcher.data, triggerToast]);
 
-  const metrics = displayedScan
-    ? {
-        complianceScore: displayedScan.complianceScore ?? 0,
-        violations: displayedScan.violations,
-        productsScanned: displayedScan.productsScanned,
-        timestamp: displayedScan.completedAt ?? displayedScan.startedAt,
-        market: displayedScan.market,
+  useEffect(() => {
+    if (rescanFetcher.state === "idle" && rescanFetcher.data?.scan) {
+      setScanHistory((prev) => prev.map((scan) => (scan.id === rescanFetcher.data!.scan.id ? rescanFetcher.data!.scan : scan)));
+      if (rescanFetcher.data.rescanProductId) {
+        const updated = rescanFetcher.data.scan.results.find((result) => result.productId === rescanFetcher.data!.rescanProductId);
+        if (updated) {
+          setLocalHistory((prev) => [
+            ...prev,
+            {
+              productId: updated.productId,
+              scannedAt: new Date().toISOString(),
+              complianceScore: updated.complianceScore ?? 0,
+            },
+          ]);
+        }
       }
-    : null;
+      triggerToast(rescanFetcher.data.toast);
+    }
+  }, [rescanFetcher.state, rescanFetcher.data, triggerToast]);
 
-  const totalPages = displayedScan ? Math.max(1, Math.ceil(displayedScan.results.length / RESULTS_PER_PAGE)) : 1;
+  useEffect(() => {
+    if (scheduleFetcher.state === "idle" && scheduleFetcher.data?.schedule) {
+      setScheduleState((prev) => {
+        const filtered = prev.filter((item) => !(item.productId === scheduleFetcher.data!.schedule.productId));
+        return [...filtered, scheduleFetcher.data.schedule];
+      });
+      triggerToast(scheduleFetcher.data.toast);
+    }
+  }, [scheduleFetcher.state, scheduleFetcher.data, triggerToast]);
+
+  useEffect(() => {
+    if (applyFixFetcher.state === "idle" && applyFixFetcher.data?.success) {
+      triggerToast("Product updated");
+      setPendingApplyProductId(null);
+    } else if (applyFixFetcher.state === "submitting") {
+      const productId = applyFixFetcher.formData?.get("productId")?.toString() ?? null;
+      setPendingApplyProductId(productId);
+    }
+  }, [applyFixFetcher.state, applyFixFetcher.data, triggerToast]);
+
+  const summaryMetrics = useMemo(() => buildSummary(scanHistory), [scanHistory]);
+  const chartHistoryByProduct = useMemo(() => groupHistory(localHistory), [localHistory]);
 
   const visibleResults = useMemo(() => {
     if (!displayedScan) return [];
@@ -180,257 +253,566 @@ export default function AppScansPage() {
     return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
   }, [displayedScan, currentPage]);
 
-  const rows = visibleResults.map((result) => {
-    const hasViolations = result.violations.length > 0;
-    return [
-      <Stack key={`${result.productId}-product`} vertical spacing="200">
-        <Text variant="bodyMd" as="span">
-          {result.productTitle}
-        </Text>
-        <Text tone="subdued" as="span">
-          {hasViolations ? `${result.violations.length} violation${result.violations.length === 1 ? "" : "s"}` : "Clean"}
-        </Text>
-      </Stack>,
-      hasViolations ? (
-        <Stack key={`${result.productId}-policies`} vertical spacing="200">
-          {result.violations.map((violation, index) => (
-            <div key={`${result.productId}-violation-${index}`}>
-              <InlineStack gap="200" align="space-between">
-                <InlineStack gap="200" blockAlign="center">
-                  <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
-                  <Badge tone={riskTone(violation.riskScore)}>
-                    Risk {formatRisk(violation.riskScore)}
-                  </Badge>
-                </InlineStack>
-                {violation.sourceUrl && (
-                  <Link url={violation.sourceUrl} target="_blank">
-                    Reference
-                  </Link>
-                )}
-              </InlineStack>
-              <Text variant="bodySm" as="p">
-                <strong>{violation.policy}</strong> · {violation.law}
-              </Text>
-              <Text variant="bodySm" tone="subdued" as="p">
-                {violation.issue}
-              </Text>
-            </div>
-          ))}
-        </Stack>
-      ) : (
-        <Badge tone="success">No violations</Badge>
-      ),
-      hasViolations ? (
-        <Stack key={`${result.productId}-suggestions`} vertical spacing="200">
-          {result.violations.map((violation, index) => (
-            <Text key={`${result.productId}-suggestion-${index}`} variant="bodySm" as="p">
-              {violation.suggestion}
-            </Text>
-          ))}
-        </Stack>
-      ) : (
-        <Text tone="subdued">No action required.</Text>
-      ),
-    ];
-  });
+  const scanHistoryOptions = scanHistory.map((scan) => ({
+    label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
+    value: scan.id,
+  }));
+
+  const notificationsActivator = (
+    <Button icon={NotificationIcon} onClick={() => setNotificationPopoverOpen((prev) => !prev)}>{shopNotifications.length}</Button>
+  );
+
+  const exportButton = (
+    <Button disclosure onClick={() => setExportPopoverActive((prev) => !prev)} disabled={!displayedScan || isFreePlan}>
+      Export Report
+    </Button>
+  );
+
+  const exportActivator = isFreePlan ? (
+    <PolarisTooltip content="Upgrade required" dismissOnMouseOut>
+      <span>{exportButton}</span>
+    </PolarisTooltip>
+  ) : (
+    exportButton
+  );
+
+  const exportPopover = (
+    <Popover active={exportPopoverActive && !isFreePlan && Boolean(displayedScan)} onClose={() => setExportPopoverActive(false)} activator={exportActivator}>
+      <ActionList
+        items={[
+          { content: "Export CSV", onAction: () => handleExport(displayedScan, "csv") },
+          { content: "Export PDF", onAction: () => handleExport(displayedScan, "pdf") },
+        ]}
+      />
+    </Popover>
+  );
+
+  const triggerToast = useCallback(
+    (message?: string) => {
+      if (!message || !appBridge) return;
+      const toast = Toast.create(appBridge, { message });
+      toast.dispatch(Toast.Action.SHOW);
+    },
+    [appBridge],
+  );
+
+  const handlePreview = useCallback((result: ComplianceFinding) => {
+    setPreviewProduct(result);
+    setPreviewContent(result.aiRewrite?.description ?? result.originalDescription);
+    setManualEditEnabled(false);
+  }, []);
+
+  const handleApplyFix = useCallback(
+    (product: ComplianceFinding, usePreview = false) => {
+      const description = usePreview
+        ? previewContent
+        : product.aiRewrite?.description ?? product.originalDescription;
+      applyFixFetcher.submit({ productId: product.productId, description }, { method: "post", action: "/api/scan/apply" });
+    },
+    [applyFixFetcher, previewContent],
+  );
+
+  const handleSchedule = useCallback(
+    (productId: string, frequency: "daily" | "weekly" | "monthly") => {
+      const formData = new FormData();
+      formData.append("intent", "scheduleProduct");
+      formData.append("productId", productId);
+      formData.append("frequency", frequency);
+      formData.append("market", market);
+      scheduleFetcher.submit(formData, { method: "post" });
+    },
+    [scheduleFetcher, market],
+  );
+
+  const handleExport = useCallback((scan: SerializedScan | undefined, format: "csv" | "pdf") => {
+    if (!scan || typeof window === "undefined") return;
+    const url = new URL(`/api/scan/export`, window.location.origin);
+    url.searchParams.set("scanId", scan.id);
+    url.searchParams.set("market", scan.market);
+    url.searchParams.set("format", format);
+    window.open(url.toString(), "_blank");
+  }, []);
+
+  const handleApplyAll = useCallback(
+    async (scan: SerializedScan | undefined) => {
+      if (!scan || typeof window === "undefined") return;
+      const payloads = scan.results.filter((result) => result.aiRewrite?.description);
+      if (!payloads.length) {
+        triggerToast("No AI fixes available");
+        return;
+      }
+      setBulkApplying(true);
+      try {
+        await Promise.all(
+          payloads.map((result) =>
+            fetch("/api/scan/apply", {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({
+                productId: result.productId,
+                description: result.aiRewrite!.description ?? result.originalDescription,
+              }).toString(),
+            }),
+          ),
+        );
+        triggerToast("AI fixes queued");
+      } catch (error) {
+        console.error(error);
+        triggerToast("Unable to apply all fixes");
+      } finally {
+        setBulkApplying(false);
+      }
+    },
+    [triggerToast],
+  );
 
   return (
-    <>
-      <Layout>
-        <Layout.Section>
-          <Text variant="headingLg" as="h1">
-            AI Compliance Scan
-          </Text>
-          <Text tone="subdued" as="p">
-            Scan your catalog for Google Ads and market-specific regulations. Every issue now includes the policy, governing law, severity level, and a risk score so you can justify remediation work immediately.
-          </Text>
-        </Layout.Section>
+    <Layout>
+      <Layout.Section>
+        <Box
+          background="bg-surface-secondary"
+          borderRadius="300"
+          padding="400"
+          shadow="card"
+          style={{ position: "sticky", top: 0, zIndex: 10 }}
+        >
+          <Stack spacing="400">
+            <InlineStack align="space-between" blockAlign="center">
+              <div>
+                <Text variant="headingLg" as="h1">
+                  Compliance Intelligence Dashboard
+                </Text>
+                <Text tone="subdued" as="p">
+                  Automated AI enforcement with policy citations, remediation workflows, and scheduled rescans.
+                </Text>
+              </div>
+              <InlineStack gap="200" blockAlign="center">
+                {exportPopover}
+                <Popover
+                  active={notificationPopoverOpen}
+                  activator={notificationsActivator}
+                  onClose={() => setNotificationPopoverOpen(false)}
+                >
+                  <Box padding="300" minWidth="320px">
+                    <Text variant="headingSm">Alerts</Text>
+                    <Divider borderColor="border" style={{ margin: "var(--p-space-200) 0" }} />
+                    <Stack vertical spacing="200">
+                      {shopNotifications.length === 0 && (
+                        <Text tone="subdued">No alerts right now.</Text>
+                      )}
+                      {shopNotifications.map((notification) => (
+                        <Stack key={notification.id} vertical spacing="100">
+                          <InlineStack gap="200" blockAlign="center">
+                            <Badge tone={notification.severity === "critical" ? "critical" : "warning"}>
+                              {notification.severity === "critical" ? "High" : "Medium"}
+                            </Badge>
+                            <Text variant="bodySm" tone="subdued">{formatRelative(notification.createdAt)}</Text>
+                          </InlineStack>
+                          <Text variant="bodyMd" as="p">{notification.title}</Text>
+                          <Text tone="subdued" as="p">{notification.detail}</Text>
+                        </Stack>
+                      ))}
+                    </Stack>
+                  </Box>
+                </Popover>
+              </InlineStack>
+            </InlineStack>
 
-        <Layout.Section>
-          <Banner status="info">
-            This AI-powered scan stays in sync with the latest Google Ads and local law updates. Each violation references the governing rule so your team can document decisions quickly.
-          </Banner>
-        </Layout.Section>
+            <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
+              <SummaryMetricCard
+                title="Compliance score"
+                icon={CheckCircleIcon}
+                value={`${summaryMetrics.overallScore}%`}
+                description="Weighted by recent scans"
+              />
+              <SummaryMetricCard
+                title="Violations this week"
+                icon={AlertCircleIcon}
+                value={summaryMetrics.violationsThisWeek.toString()}
+                description="Across all markets"
+              />
+              <SummaryMetricCard
+                title="Scheduled products"
+                icon={CalendarCheckIcon}
+                value={scheduleState.length.toString()}
+                description="Auto rescans enabled"
+              />
+            </InlineGrid>
 
-        <Layout.Section>
-          <Card>
-            <Stack spacing="400">
+            <InlineStack gap="200" wrap blockAlign="center">
+              <runScanFetcher.Form method="post">
+                <input type="hidden" name="intent" value="startScan" />
+                <input type="hidden" name="market" value={market} />
+                <Button primary submit disabled={runScanFetcher.state !== "idle"} icon={RefreshIcon}>
+                  {runScanFetcher.state !== "idle" ? "Scanning…" : "Rescan all products"}
+                </Button>
+              </runScanFetcher.Form>
               <Select
-                label="Select market to scan"
+                labelHidden
+                label="Market"
                 options={MARKETS}
                 value={market}
                 onChange={(value) => setMarket(value)}
               />
-              <Text as="p" tone="subdued">
-                We localize each scan to the selected market so policy citations and risk scoring reflect current laws.
-              </Text>
-              {history.length > 0 && (
-                <Select
-                  label="Scan history"
-                  options={scanHistoryOptions}
-                  value={selectedScanId ?? undefined}
-                  onChange={(value) => {
-                    setSelectedScanId(value);
-                    setCurrentPage(0);
-                  }}
-                  placeholder="Most recent"
-                />
-              )}
-            </Stack>
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section>
-          {aiConnected ? (
-            <Banner status="success" title="AI connection active">
-              Analysis powered by OpenAI GPT-4o-mini.
-            </Banner>
-          ) : (
-            <Banner status="critical" title="AI connection failed">
-              <p>We couldn’t connect to OpenAI. Please check your API key or try again later.</p>
-            </Banner>
-          )}
-        </Layout.Section>
-
-        <Layout.Section>
-          <Layout>
-            {getMetricCards(metrics).map((metric) => (
-              <Layout.Section key={metric.title} variant="oneThird">
-                <Card>
-                  <Stack spacing="300" alignment="center">
-                    <Icon source={metric.icon} tone="primary" />
-                    <div>
-                      <Text variant="headingMd" as="h3">
-                        {metric.title}
-                      </Text>
-                      <Text variant="headingLg" as="p">
-                        {metric.value}
-                      </Text>
-                      <Text as="p" tone="subdued">
-                        {metric.description}
-                      </Text>
-                    </div>
-                  </Stack>
-                </Card>
-              </Layout.Section>
-            ))}
-          </Layout>
-        </Layout.Section>
-
-        <Layout.Section>
-          <Card title="Run New Scan" sectioned>
-            <Text as="p" tone="subdued">
-              We pull live product data from Shopify, cross-reference Google Ads and market regulations, and surface every violation with documented policy and law metadata.
-            </Text>
-            <InlineStack gap="300" blockAlign="center" style={{ marginTop: "var(--p-space-400)" }}>
-              <runScanFetcher.Form method="post">
-                <input type="hidden" name="intent" value="startScan" />
-                <input type="hidden" name="market" value={market} />
-                <Button primary submit disabled={isScanning}>
-                  {isScanning ? (
-                    <InlineStack gap="200" blockAlign="center">
-                      <Spinner size="small" />
-                      <span>Scanning…</span>
-                    </InlineStack>
-                  ) : (
-                    "Run Compliance Scan"
-                  )}
+              {isFreePlan ? (
+                <PolarisTooltip content="Upgrade required" dismissOnMouseOut>
+                  <span>
+                    <Button disabled>Apply all AI suggestions</Button>
+                  </span>
+                </PolarisTooltip>
+              ) : (
+                <Button
+                  onClick={() => handleApplyAll(displayedScan)}
+                  disabled={!displayedScan || bulkApplying}
+                >
+                  {bulkApplying ? "Applying…" : "Apply all AI suggestions"}
                 </Button>
-              </runScanFetcher.Form>
-              {metrics?.timestamp && (
-                <Text as="span" tone="subdued">
-                  Last scan: {formatTimestamp(metrics.timestamp)} ({metrics.market.toUpperCase()})
-                </Text>
               )}
             </InlineStack>
-            {isScanning && (
-              <div style={{ marginTop: "var(--p-space-400)" }}>
-                <SkeletonDisplayText size="small" />
-                <SkeletonBodyText lines={3} />
-              </div>
-            )}
-          </Card>
+          </Stack>
+        </Box>
+      </Layout.Section>
+
+      {!aiConnected && (
+        <Layout.Section>
+          <Banner status="critical" title="AI connection failed">
+            We could not reach OpenAI. Double-check your OPENAI_API_KEY and retry.
+          </Banner>
         </Layout.Section>
+      )}
 
-        {scanError && (
-          <Layout.Section>
-            <Banner status="critical" onDismiss={() => setScanError(null)}>
-              {scanError}
-            </Banner>
-          </Layout.Section>
-        )}
-
-        {displayedScan && (
-          <Layout.Section>
-            <Card>
-              <Stack spacing="400">
-                <div>
-                  <Text variant="headingLg" as="h2">
-                    Scan Results
-                  </Text>
-                  <Text as="p" tone="subdued">
-                    Every violation includes the Google Ads policy, local law reference, severity badge, and AI remediation note.
-                  </Text>
-                </div>
-                <Divider />
-                <InlineStack align="space-between" blockAlign="center">
+      <Layout.Section>
+        <Card>
+          <Stack spacing="400">
+            <Select
+              label="Scan history"
+              options={scanHistoryOptions}
+              value={selectedScanId ?? undefined}
+              onChange={(value) => {
+                setSelectedScanId(value);
+                setCurrentPage(0);
+              }}
+              placeholder="Most recent"
+            />
+            {displayedScan && (
+              <InlineStack align="space-between" blockAlign="center">
+                <Text tone="subdued">
+                  Completed {formatTimestamp(displayedScan.completedAt ?? displayedScan.startedAt)} — Market {displayedScan.market.toUpperCase()}
+                </Text>
+                {displayedScan.results.length > RESULTS_PER_PAGE && (
                   <InlineStack gap="200" blockAlign="center">
-                    <Button onClick={() => setUpgradeModalOpen(true)}>Apply All AI Suggestions</Button>
-                    <Text as="span" tone="subdued">
-                      Upgrade required for automatic remediation.
+                    <ButtonGroup>
+                      <Button onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 0))} disabled={currentPage === 0}>
+                        Previous
+                      </Button>
+                      <Button
+                        onClick={() => setCurrentPage((prev) =>
+                          displayedScan ? Math.min(prev + 1, Math.ceil(displayedScan.results.length / RESULTS_PER_PAGE) - 1) : prev,
+                        )}
+                        disabled={!displayedScan || (currentPage + 1) * RESULTS_PER_PAGE >= displayedScan.results.length}
+                      >
+                        Next
+                      </Button>
+                    </ButtonGroup>
+                    <Text tone="subdued">
+                      Page {currentPage + 1} / {Math.max(1, Math.ceil(displayedScan.results.length / RESULTS_PER_PAGE))}
                     </Text>
                   </InlineStack>
-                  {displayedScan.results.length > RESULTS_PER_PAGE && (
-                    <InlineStack gap="200" blockAlign="center">
-                      <Pagination
-                        hasPrevious={currentPage > 0}
-                        onPrevious={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
-                        hasNext={currentPage < totalPages - 1}
-                        onNext={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
-                      />
-                      <Text tone="subdued">
-                        Page {currentPage + 1} of {totalPages}
-                      </Text>
-                    </InlineStack>
-                  )}
-                </InlineStack>
-                {visibleResults.length === 0 ? (
-                  <Text tone="subdued">No products matched this page.</Text>
-                ) : (
-                  <DataTable
-                    columnContentTypes={["text", "text", "text"]}
-                    headings={["Product", "Policy & Law Context", "AI Guidance"]}
-                    rows={rows}
-                  />
                 )}
-              </Stack>
-            </Card>
-          </Layout.Section>
-        )}
+              </InlineStack>
+            )}
+          </Stack>
+        </Card>
+      </Layout.Section>
 
-        {!displayedScan && (
-          <Layout.Section>
-            <Card sectioned>
-              <Text>No scans yet. Kick off your first scan to see results here.</Text>
-            </Card>
-          </Layout.Section>
+      <Layout.Section>
+        {displayedScan ? (
+          <Stack vertical spacing="400">
+            {visibleResults.map((result) => (
+              <ProductResultCard
+                key={result.productId}
+                shopDomain={shop}
+                result={result}
+                history={chartHistoryByProduct[result.productId] ?? []}
+                schedule={scheduleState.find((schedule) => schedule.productId === result.productId)}
+                expanded={Boolean(expandedProducts[result.productId])}
+                toggleExpanded={() =>
+                  setExpandedProducts((prev) => ({ ...prev, [result.productId]: !prev[result.productId] }))
+                }
+                onPreview={() => handlePreview(result)}
+                onFix={() => handleApplyFix(result)}
+                onRescan={() => {
+                  if (!displayedScan) return;
+                  const formData = new FormData();
+                  formData.append("intent", "rescanProduct");
+                  formData.append("productId", result.productId);
+                  formData.append("scanId", displayedScan.id);
+                  rescanFetcher.submit(formData, { method: "post" });
+                }}
+                onSchedule={(frequency) => handleSchedule(result.productId, frequency)}
+                applying={pendingApplyProductId === result.productId && applyFixFetcher.state !== "idle"}
+                isFreePlan={isFreePlan}
+              />
+            ))}
+          </Stack>
+        ) : (
+          <Card sectioned>
+            <Text>No scans yet. Run your first scan to see AI insights.</Text>
+          </Card>
         )}
-      </Layout>
+      </Layout.Section>
 
       <Modal
-        open={upgradeModalOpen}
-        onClose={() => setUpgradeModalOpen(false)}
-        title="Upgrade your plan to automatically apply AI compliance fixes"
-        primaryAction={{ content: "Upgrade Plan", onAction: () => setUpgradeModalOpen(false) }}
-        secondaryActions={[{ content: "Maybe later", onAction: () => setUpgradeModalOpen(false) }]}
+        open={Boolean(previewProduct)}
+        onClose={() => setPreviewProduct(null)}
+        title={previewProduct ? `AI Fix Preview — ${previewProduct.productTitle}` : "AI Fix Preview"}
+        large
+        primaryAction={{
+          content: "Apply Fix",
+          disabled: !previewProduct,
+          onAction: () => {
+            if (!previewProduct) return;
+            handleApplyFix(previewProduct, true);
+            setPreviewProduct(null);
+          },
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setPreviewProduct(null) }]}
       >
         <Modal.Section>
-          <Text as="p" tone="subdued">
-            Batch remediation, scheduling, and policy exports are available on the Growth and Agency plans. Contact support to enable these features.
-          </Text>
+          {previewProduct ? (
+            <Stack vertical spacing="400">
+              <Card title="Original snippet">
+                <Text as="p" tone="subdued">
+                  {previewProduct.originalDescription}
+                </Text>
+              </Card>
+              <Card title="AI rewrite">
+                <Stack vertical spacing="300">
+                  <Checkbox
+                    label="Allow manual edits"
+                    checked={manualEditEnabled}
+                    onChange={(value) => setManualEditEnabled(value)}
+                  />
+                  <TextField
+                    value={previewContent}
+                    onChange={setPreviewContent}
+                    multiline
+                    autoComplete="off"
+                    disabled={!manualEditEnabled}
+                  />
+                </Stack>
+              </Card>
+            </Stack>
+          ) : (
+            <Text tone="subdued">Select a product to preview AI fixes.</Text>
+          )}
         </Modal.Section>
       </Modal>
-    </>
+    </Layout>
+  );
+}
+
+function SummaryMetricCard({
+  title,
+  icon,
+  value,
+  description,
+}: {
+  title: string;
+  icon: any;
+  value: string;
+  description: string;
+}) {
+  return (
+    <Card>
+      <Stack spacing="300" alignment="center">
+        <Icon source={icon} tone="primary" />
+        <div>
+          <Text variant="headingMd" as="h3">
+            {title}
+          </Text>
+          <Text variant="headingLg" as="p">
+            {value}
+          </Text>
+          <Text as="p" tone="subdued">
+            {description}
+          </Text>
+        </div>
+      </Stack>
+    </Card>
+  );
+}
+
+function ProductResultCard({
+  shopDomain,
+  result,
+  history,
+  schedule,
+  expanded,
+  toggleExpanded,
+  onPreview,
+  onFix,
+  onRescan,
+  onSchedule,
+  applying,
+  isFreePlan,
+}: {
+  shopDomain: string;
+  result: ComplianceFinding;
+  history: { scannedAt: string; complianceScore: number }[];
+  schedule?: { productId: string; frequency: string; nextRun: string | Date | null };
+  expanded: boolean;
+  toggleExpanded: () => void;
+  onPreview: () => void;
+  onFix: () => void;
+  onRescan: () => void;
+  onSchedule: (frequency: "daily" | "weekly" | "monthly") => void;
+  applying: boolean;
+  isFreePlan: boolean;
+}) {
+  const hasViolations = result.violations.length > 0;
+  const highestSeverity = getHighestSeverity(result.violations);
+  const summaryBadgeTone = hasViolations ? severityTone(highestSeverity) : "success";
+  const summaryLabel = hasViolations ? `${result.violations.length} flagged` : "Clean";
+
+  return (
+    <Card sectioned>
+      <Stack vertical spacing="300">
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="200" blockAlign="center">
+            <Icon source={ProductIcon} tone="subdued" />
+            <div>
+              <Text variant="headingSm" as="h3">
+                {result.productTitle}
+              </Text>
+              <Text tone="subdued" as="p">
+                {shopDomain}
+              </Text>
+            </div>
+          </InlineStack>
+          <Badge tone={summaryBadgeTone}>{summaryLabel}</Badge>
+        </InlineStack>
+
+        <InlineStack align="space-between" blockAlign="start">
+          <InlineStack gap="200" blockAlign="center">
+            <Badge tone="info">Score {result.complianceScore}%</Badge>
+            <Badge tone="subdued">Market {result.market.toUpperCase()}</Badge>
+          </InlineStack>
+          <InlineStack gap="200">
+            <Button size="slim" onClick={onFix} disabled={!result.aiRewrite || applying}>
+              {applying ? (
+                <InlineStack gap="100" blockAlign="center">
+                  <Spinner size="small" />
+                  <span>Fixing…</span>
+                </InlineStack>
+              ) : (
+                "Fix with AI"
+              )}
+            </Button>
+            <Button size="slim" onClick={onPreview} disabled={!result.aiRewrite}>
+              Preview fix
+            </Button>
+            <Button size="slim" onClick={onRescan}>
+              Rescan product
+            </Button>
+          </InlineStack>
+        </InlineStack>
+
+        <InlineStack align="space-between" wrap blockAlign="center">
+          <div style={{ minWidth: 200, height: 120 }}>
+            <ProductHistorySparkline data={history} />
+          </div>
+          <InlineStack gap="200" blockAlign="center">
+            <Select
+              label="Schedule auto-rescan"
+              labelHidden
+              options={SCHEDULE_OPTIONS}
+              value={schedule?.frequency ?? ""}
+              placeholder="Select frequency"
+              onChange={(value) => onSchedule(value as "daily" | "weekly" | "monthly")}
+              disabled={isFreePlan}
+            />
+            {schedule?.nextRun && (
+              <Text tone="subdued" as="span">
+                Next run {formatTimestamp(schedule.nextRun)}
+              </Text>
+            )}
+          </InlineStack>
+        </InlineStack>
+
+        <Button fullWidth onClick={toggleExpanded} accessibilityLabel="Toggle violation details">
+          {expanded ? "Hide details" : "Show details"}
+        </Button>
+
+        {expanded && (
+          <Stack vertical spacing="200">
+            {hasViolations ? (
+              result.violations.map((violation, index) => (
+                <Card key={`${result.productId}-violation-${index}`} subdued sectioned>
+                  <InlineStack align="space-between" blockAlign="center">
+                    <InlineStack gap="200" blockAlign="center">
+                      <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
+                      <Badge tone={riskTone(violation.riskScore)}>
+                        Risk {formatRisk(violation.riskScore)}
+                      </Badge>
+                    </InlineStack>
+                    {violation.sourceUrl && (
+                      <Link url={violation.sourceUrl} target="_blank">
+                        View policy reference
+                      </Link>
+                    )}
+                  </InlineStack>
+                  <Text variant="bodyMd" as="p">
+                    <strong>{violation.policy}</strong> · {violation.law}
+                  </Text>
+                  <Text variant="bodySm" tone="subdued" as="p">
+                    {violation.issue}
+                  </Text>
+                  <Text variant="bodySm" as="p">
+                    <strong>Why this matters:</strong> {violation.whyMatters}
+                  </Text>
+                  <Text variant="bodySm" as="p">
+                    <strong>AI guidance:</strong> {violation.suggestion}
+                  </Text>
+                </Card>
+              ))
+            ) : (
+              <Text tone="subdued">Everything looks compliant for this product.</Text>
+            )}
+          </Stack>
+        )}
+      </Stack>
+    </Card>
+  );
+}
+
+function ProductHistorySparkline({
+  data,
+}: {
+  data: { scannedAt: string; complianceScore: number }[];
+}) {
+  if (data.length < 2) {
+    return (
+      <div style={{ display: "flex", height: "100%", alignItems: "center", justifyContent: "center" }}>
+        <Text tone="subdued">No history</Text>
+      </div>
+    );
+  }
+
+  const formatted = data.map((entry) => ({
+    date: new Date(entry.scannedAt).toLocaleDateString(),
+    compliance: entry.complianceScore,
+  }));
+
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={formatted} margin={{ top: 10, right: 0, left: 0, bottom: 0 }}>
+        <XAxis dataKey="date" hide />
+        <YAxis domain={[0, 100]} hide />
+        <RechartsTooltip formatter={(value) => `${value}%`} labelFormatter={(label) => `Scan ${label}`} />
+        <Line type="monotone" dataKey="compliance" stroke="#5c6ac4" strokeWidth={2} dot={false} />
+      </LineChart>
+    </ResponsiveContainer>
   );
 }
 
@@ -442,322 +824,47 @@ const MARKETS = [
   { label: "Canada", value: "ca" },
 ];
 
-function formatTimestamp(value: string) {
-  return new Date(value).toLocaleString();
-}
+const SCHEDULE_OPTIONS = [
+  { label: "Daily", value: "daily" },
+  { label: "Weekly", value: "weekly" },
+  { label: "Monthly", value: "monthly" },
+];
 
-function serializeScan(scan: Scan): SerializedScan {
-  const rawResults = (scan.results as ComplianceFinding[] | undefined) ?? [];
-  return {
-    ...scan,
-    startedAt: scan.startedAt.toISOString(),
-    completedAt: scan.completedAt ? scan.completedAt.toISOString() : null,
-    results: rawResults.map((raw) => normalizeFinding(raw, { market: scan.market, shopDomain: scan.shopDomain })),
-  };
-}
-
-async function runComplianceScan({ admin, session, market }: { admin: any; session: any; market: string }) {
-  const products = await fetchAllProducts(admin);
-  if (!products.length) {
-    throw new Error("No products found to scan.");
+function buildSummary(scans: SerializedScan[]) {
+  if (!scans.length) {
+    return { overallScore: 0, violationsThisWeek: 0 };
   }
-
-  const rules = getPolicyRules(market);
-  const openAiClient = openai;
-  if (!openAiClient) {
-    throw new Error("OpenAI API key missing. Add OPENAI_API_KEY to the environment.");
-  }
-
-  const results: ComplianceFinding[] = [];
-
-  for (const product of products) {
-    const finding = await analyzeProduct({
-      product,
-      rules,
-      market,
-      openAiClient,
-      shopDomain: session.shop,
-    });
-    results.push(finding);
-  }
-
-  const violationCount = results.reduce((sum, result) => sum + result.violations.length, 0);
-  const complianceScore = results.length
-    ? Math.round(results.reduce((sum, r) => sum + r.complianceScore, 0) / results.length)
-    : 100;
-
-  const saved = await prisma.scan.create({
-    data: {
-      shopDomain: session.shop,
-      market,
-      complianceScore,
-      violations: violationCount,
-      productsScanned: results.length,
-      status: "complete",
-      completedAt: new Date(),
-      results,
-    },
-  });
-
-  return saved;
-}
-
-async function fetchAllProducts(admin: any, batchSize = 50) {
-  const products: any[] = [];
-  let after: string | null = null;
-  let hasNextPage = true;
-
-  while (hasNextPage) {
-    const response = await admin.graphql(PRODUCTS_QUERY, { variables: { first: batchSize, after } });
-    const body = await response.json();
-    const nodes = body?.data?.products?.nodes ?? [];
-    products.push(...nodes);
-    const pageInfo = body?.data?.products?.pageInfo;
-    hasNextPage = Boolean(pageInfo?.hasNextPage);
-    after = pageInfo?.endCursor ?? null;
-  }
-
-  return products;
-}
-
-async function analyzeProduct({
-  product,
-  rules,
-  market,
-  openAiClient,
-  shopDomain,
-}: {
-  product: any;
-  rules: PolicyRule[];
-  market: string;
-  openAiClient: any;
-  shopDomain: string;
-}): Promise<ComplianceFinding> {
-  const plainDescription = stripHtml(product.descriptionHtml ?? "");
-  const metafieldsText = (product.metafields?.edges ?? [])
-    .map((edge: any) => `${edge.node.namespace} ${edge.node.key} ${edge.node.value}`)
-    .join(" ");
-  const combined = `${product.title}\n${plainDescription}\n${product.tags?.join(" ") ?? ""}\n${metafieldsText}`.toLowerCase();
-
-  const matches = detectPolicyMatches(combined, rules);
-  const heuristicViolations = buildHeuristicViolations(matches, market, product.title);
-
-  const aiViolations = await buildAiViolations({
-    openAiClient,
-    market,
-    productTitle: product.title,
-    description: plainDescription,
-    url: product.onlineStoreUrl,
-    policyHints: heuristicViolations.map((violation) => `${violation.policy}: ${violation.issue}`),
-  });
-
-  const combinedViolations = dedupeViolations([...heuristicViolations, ...aiViolations]);
-  const complianceScore = calculateComplianceScore(combinedViolations);
-
-  return {
-    productId: product.id,
-    legacyResourceId: product.legacyResourceId?.toString(),
-    productTitle: product.title,
-    market,
-    shopDomain,
-    violations: combinedViolations,
-    complianceScore,
-    status: combinedViolations.length ? "flagged" : "clean",
-  };
-}
-
-function detectPolicyMatches(text: string, rules: PolicyRule[]) {
-  return rules
-    .map((rule) => {
-      const matchingWords = rule.keywords.filter((keyword) => text.includes(keyword.toLowerCase()));
-      return matchingWords.length ? { rule, matchingWords } : null;
-    })
-    .filter(Boolean) as { rule: PolicyRule; matchingWords: string[] }[];
-}
-
-function buildHeuristicViolations(
-  matches: { rule: PolicyRule; matchingWords: string[] }[],
-  market: string,
-  productTitle: string,
-): ComplianceViolation[] {
-  if (!matches.length) return [];
-  const lawReference = getMarketLawReference(market);
-
-  return matches.map(({ rule, matchingWords }) => {
-    const severity = toSeverityLabel(rule.severity);
-    return {
-      issue: `${rule.description}. Flagged terms: ${matchingWords.join(", ")}.`,
-      policy: `Google Ads – ${rule.category}`,
-      law: lawReference.law,
-      severity,
-      riskScore: severityToRiskScore(severity),
-      suggestion: `Rephrase references to ${matchingWords[0] ?? productTitle} to align with ${lawReference.law}.`,
-      sourceUrl: lawReference.url,
-    };
-  });
-}
-
-async function buildAiViolations({
-  openAiClient,
-  market,
-  productTitle,
-  description,
-  url,
-  policyHints,
-}: {
-  openAiClient: any;
-  market: string;
-  productTitle: string;
-  description: string;
-  url?: string | null;
-  policyHints: string[];
-}): Promise<ComplianceViolation[]> {
-  if (!openAiClient) return [];
-
-  const lawReference = getMarketLawReference(market);
-  const truncatedDescription = description.slice(0, 3500);
-  const hints = policyHints.slice(0, 6).join("\n");
-
-  try {
-    const completion = await openAiClient.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a compliance analyst for Shopify merchants. Compare product data to Google Ads policies and the specified market's ecommerce laws. Return structured JSON only.",
-        },
-        {
-          role: "user",
-          content: `Market: ${market.toUpperCase()}
-Local law focus: ${lawReference.law}
-Product title: ${productTitle}
-Product description: ${truncatedDescription}
-Product URL: ${url ?? "N/A"}
-Known heuristic flags: ${hints || "None"}
-Return JSON {"violations":[{"issue":"","policy":"","law":"","severity":"High|Medium|Low","riskScore":0-1,"suggestion":"","sourceUrl":""}]}.` ,
-        },
-      ],
-    });
-
-    const content = completion.choices?.[0]?.message?.content;
-    if (!content) return [];
-    const parsed = JSON.parse(content);
-    if (Array.isArray(parsed.violations)) {
-      return parsed.violations
-        .map((violation: any) => normalizeViolation(violation, market))
-        .filter((violation): violation is ComplianceViolation => Boolean(violation.issue));
+  const overallScore = scans[0]?.complianceScore ?? 0;
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const violationsThisWeek = scans.reduce((sum, scan) => {
+    const timestamp = new Date(scan.completedAt ?? scan.startedAt).getTime();
+    if (timestamp >= weekAgo) {
+      return sum + scan.violations;
     }
-    return [];
-  } catch (error) {
-    console.error("OpenAI violation generation failed", error);
-    return [];
-  }
+    return sum;
+  }, 0);
+  return { overallScore, violationsThisWeek };
 }
 
-function dedupeViolations(violations: ComplianceViolation[]) {
-  const seen = new Set<string>();
-  return violations.filter((violation) => {
-    const key = `${violation.issue}|${violation.policy}|${violation.law}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+function groupHistory(history: ProductHistoryPoint[]) {
+  return history.reduce<Record<string, { scannedAt: string; complianceScore: number }[]>>((acc, item) => {
+    if (!acc[item.productId]) acc[item.productId] = [];
+    acc[item.productId].push(item);
+    return acc;
+  }, {});
 }
 
-function calculateComplianceScore(violations: ComplianceViolation[]) {
-  if (!violations.length) return 100;
-  const penalty = violations.reduce((sum, violation) => sum + violation.riskScore * 35, 0);
-  return Math.max(0, Math.round(100 - penalty));
+function getHighestSeverity(violations: ComplianceFinding["violations"]) {
+  if (!violations.length) return "Low";
+  if (violations.some((violation) => violation.severity === "High")) return "High";
+  if (violations.some((violation) => violation.severity === "Medium")) return "Medium";
+  return "Low";
 }
 
-function normalizeFinding(raw: any, fallback: { market: string; shopDomain: string }): ComplianceFinding {
-  const productId = raw?.productId ?? raw?.id ?? "unknown";
-  const market = raw?.market ?? fallback.market;
-  const violations = Array.isArray(raw?.violations)
-    ? raw.violations
-        .map((violation: any) => normalizeViolation(violation, market))
-        .filter((violation): violation is ComplianceViolation => Boolean(violation.issue))
-    : legacyViolationsFromIssues(raw, market);
-
-  return {
-    productId,
-    legacyResourceId: raw?.legacyResourceId ?? undefined,
-    productTitle: raw?.productTitle ?? raw?.title ?? "Untitled product",
-    market,
-    shopDomain: raw?.shopDomain ?? fallback.shopDomain,
-    violations,
-    complianceScore:
-      typeof raw?.complianceScore === "number" ? raw.complianceScore : calculateComplianceScore(violations),
-    status: raw?.status ?? (violations.length ? "flagged" : "clean"),
-  };
-}
-
-function legacyViolationsFromIssues(raw: any, market: string): ComplianceViolation[] {
-  if (!Array.isArray(raw?.issues) || raw.issues.length === 0) return [];
-  const lawReference = getMarketLawReference(market);
-  return raw.issues.map((issue: string) => ({
-    issue,
-    policy: raw?.policyArea ? `Google Ads – ${raw.policyArea}` : "Google Ads restricted content",
-    law: lawReference.law,
-    severity: "Medium",
-    riskScore: 0.5,
-    suggestion: "Update the copy to remove or soften this claim.",
-    sourceUrl: lawReference.url,
-  }));
-}
-
-function normalizeViolation(raw: any, market: string): ComplianceViolation {
-  if (!raw) {
-    return {
-      issue: "Potential compliance issue",
-      policy: "Google Ads restricted content",
-      law: getMarketLawReference(market).law,
-      severity: "Medium",
-      riskScore: 0.5,
-      suggestion: "Review this content for compliance.",
-    };
-  }
-
-  const severity = normalizeSeverity(raw.severity);
-  const riskSource = typeof raw.riskScore === "number" ? raw.riskScore : severityToRiskScore(severity);
-  const lawReference = raw.law ?? getMarketLawReference(market).law;
-
-  return {
-    issue: String(raw.issue ?? raw.reason ?? "Potential compliance issue"),
-    policy: String(raw.policy ?? "Google Ads restricted content"),
-    law: String(lawReference),
-    severity,
-    riskScore: clampRiskScore(riskSource),
-    suggestion: String(raw.suggestion ?? raw.replacement ?? "Update this content to comply."),
-    sourceUrl: raw.sourceUrl ?? getMarketLawReference(market).url,
-  };
-}
-
-function normalizeSeverity(value: unknown): ComplianceViolation["severity"] {
-  if (typeof value !== "string") return "Medium";
-  const upper = value.toLowerCase();
-  if (upper === "high") return "High";
-  if (upper === "low") return "Low";
-  return "Medium";
-}
-
-function toSeverityLabel(value: PolicyRule["severity"]): ComplianceViolation["severity"] {
-  return value === "high" ? "High" : value === "low" ? "Low" : "Medium";
-}
-
-function severityTone(severity: ComplianceViolation["severity"]) {
+function severityTone(severity: "High" | "Medium" | "Low") {
   if (severity === "High") return "critical";
   if (severity === "Medium") return "warning";
   return "success";
-}
-
-function severityToRiskScore(severity: ComplianceViolation["severity"]) {
-  if (severity === "High") return 0.92;
-  if (severity === "Medium") return 0.6;
-  return 0.3;
 }
 
 function riskTone(score: number) {
@@ -767,87 +874,18 @@ function riskTone(score: number) {
 }
 
 function formatRisk(score: number) {
-  return `${Math.round(clampRiskScore(score) * 100)}%`;
+  return `${Math.round(Math.min(1, Math.max(0, score)) * 100)}%`;
 }
 
-function clampRiskScore(score: number) {
-  if (Number.isNaN(score)) return 0.5;
-  return Math.min(1, Math.max(0, score));
+function formatTimestamp(value: string | Date) {
+  return new Date(value).toLocaleString();
 }
 
-function getMarketLawReference(market: string) {
-  const key = market.toLowerCase();
-  return MARKET_LAW_REFERENCES[key] ?? MARKET_LAW_REFERENCES.default;
-}
-
-const MARKET_LAW_REFERENCES: Record<string, { law: string; url?: string }> = {
-  uk: {
-    law: "UK CAP Code, ASA guidance & DfT product marketing rules",
-    url: "https://www.gov.uk/government/publications/e-scooter-trials-guidance-for-users",
-  },
-  us: {
-    law: "US FTC truth-in-advertising & FDA marketing guidance",
-    url: "https://www.ftc.gov/business-guidance/advertising-marketing",
-  },
-  eu: {
-    law: "EU Consumer Protection Regulation & Google Merchant Center EU policies",
-    url: "https://europa.eu/youreurope/business/product-requirements/index_en.htm",
-  },
-  au: {
-    law: "Australia ACCC advertising rules & TGA code",
-    url: "https://www.tga.gov.au/resources/resource/guidance/advertising-code",
-  },
-  ca: {
-    law: "Canada Competition Bureau advertising standards",
-    url: "https://www.competitionbureau.gc.ca/eic/site/cb-bc.nsf/eng/03031.html",
-  },
-  default: {
-    law: "Local consumer protection and Google Ads policies",
-    url: "https://support.google.com/adspolicy",
-  },
-};
-
-function stripHtml(raw: string) {
-  return raw.replace(/<[^>]*>?/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function getMetricCards(metrics: ReturnType<typeof buildMetrics>) {
-  const computed = buildMetrics(metrics);
-  return [
-    {
-      title: "Products Scanned",
-      value: computed.productsScanned,
-      description: "Items analyzed for Google Ads and legal compliance.",
-      icon: ProductIcon,
-    },
-    {
-      title: "Violations Found",
-      value: computed.violations,
-      description: "Policy or local law issues detected in this scan.",
-      icon: AlertCircleIcon,
-    },
-    {
-      title: "Compliance Score",
-      value: `${computed.complianceScore}%`,
-      description: "Average approval likelihood for this market.",
-      icon: CheckCircleIcon,
-    },
-  ];
-}
-
-function buildMetrics(metrics: {
-  complianceScore: number;
-  violations: number;
-  productsScanned: number;
-  timestamp: string;
-  market: string;
-} | null) {
-  if (!metrics) {
-    return {
-      complianceScore: 0,
-      violations: 0,
-      productsScanned: 0,
-    };
-  }
-  return metrics;
+function formatRelative(value: string) {
+  const diff = Date.now() - new Date(value).getTime();
+  const mins = Math.round(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
 }

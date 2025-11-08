@@ -136,7 +136,7 @@ export default function App() {
             url: linkWithParams("/app/settings"),
           }}
         />
-        <Page>
+        <Page fullWidth>
           <Outlet
             context={{
               host,

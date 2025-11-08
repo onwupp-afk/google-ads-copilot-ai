@@ -50,4 +50,57 @@ model Scan {
   productsScanned Int     @default(0)
   results        Json?
   createdAt      DateTime @default(now())
+  scanResults    ScanResult[]
+  histories      ProductScanHistory[]
+}
+
+model ScanResult {
+  id           String   @id @default(cuid())
+  scanId       String
+  productId    String
+  productTitle String
+  ruleRef      String
+  policy       String?
+  law          String?
+  market       String
+  severity     String
+  riskScore    Float
+  aiGuidance   String?
+  whyMatters   String?
+  sourceUrl    String?
+  createdAt    DateTime @default(now())
+
+  scan Scan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+
+  @@index([scanId])
+  @@index([productId])
+}
+
+model ProductScanHistory {
+  id              String   @id @default(cuid())
+  scanId          String
+  shopDomain      String
+  productId       String
+  market          String
+  complianceScore Float
+  violations      Int
+  scannedAt       DateTime @default(now())
+
+  scan Scan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+
+  @@index([productId, market])
+  @@index([shopDomain, market])
+}
+
+model ScanSchedule {
+  id         String   @id @default(cuid())
+  shopDomain String
+  productId  String
+  market     String
+  frequency  String
+  nextRun    DateTime?
+  lastRun    DateTime?
+  createdAt  DateTime @default(now())
+
+  @@unique([shopDomain, productId], name: "shopDomain_productId")
 }
