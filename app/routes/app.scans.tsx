@@ -12,7 +12,6 @@ import {
   Button,
   ButtonGroup,
   Card,
-  Checkbox,
   Collapsible,
   Divider,
   Icon,
@@ -21,13 +20,10 @@ import {
   Layout,
   LegacyStack as Stack,
   Link,
-  Modal,
   Popover,
   ProgressBar,
   Select,
-  Spinner,
   Text,
-  TextField,
   Thumbnail,
   Tooltip as PolarisTooltip,
 } from "@shopify/polaris";
@@ -51,6 +47,8 @@ import {
   type DashboardNotification,
   type SerializedScan,
 } from "../models/scan.server";
+import { AIFixWorkspace } from "../components/AIFixWorkspace";
+import type { FixScope, WorkspaceIssue, WorkspacePayload } from "../models/fixWorkspace.server";
 
 const RESULTS_PER_PAGE = 8;
 const PROGRESS_WAIT_LIMIT = 70;
@@ -132,16 +130,11 @@ export default function ComplianceDashboardPage() {
   const [selectedScanId, setSelectedScanId] = useState<string | null>(scans[0]?.id ?? null);
   const [market, setMarket] = useState<string>(((scans[0]?.market as string) ?? "uk").toLowerCase());
   const [currentPage, setCurrentPage] = useState(0);
-  const [previewProduct, setPreviewProduct] = useState<ComplianceFinding | null>(null);
-  const [previewContent, setPreviewContent] = useState("");
-  const [manualEditEnabled, setManualEditEnabled] = useState(false);
   const [expandedHistory, setExpandedHistory] = useState<Record<string, boolean>>({});
   const [notificationPopoverOpen, setNotificationPopoverOpen] = useState(false);
   const [exportPopoverActive, setExportPopoverActive] = useState(false);
   const [scheduleState, setScheduleState] = useState(schedules);
   const [localHistory, setLocalHistory] = useState(history);
-  const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
-  const [bulkApplying, setBulkApplying] = useState(false);
   const [scanResults, setScanResults] = useState<Array<ComplianceFinding | null>>(scans[0]?.results ?? []);
   const [isScanning, setIsScanning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -150,6 +143,12 @@ export default function ComplianceDashboardPage() {
   const [currentProductIndex, setCurrentProductIndex] = useState(0);
   const [scanCompleteState, setScanCompleteState] = useState<"idle" | "success" | "error">("idle");
   const [lastAnimatedScanId, setLastAnimatedScanId] = useState<string | null>(null);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceScope, setWorkspaceScope] = useState<FixScope>("all");
+  const [workspaceProductId, setWorkspaceProductId] = useState<string | null>(null);
+  const [workspacePayload, setWorkspacePayload] = useState<WorkspacePayload | undefined>(undefined);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [applyAllState, setApplyAllState] = useState({ running: false, current: 0, total: 0, label: "" });
 
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const replayTimeoutsRef = useRef<NodeJS.Timeout[]>([]);
@@ -159,7 +158,7 @@ export default function ComplianceDashboardPage() {
   const runScanFetcher = useFetcher<typeof action>();
   const rescanFetcher = useFetcher<typeof action>();
   const scheduleFetcher = useFetcher<typeof action>();
-  const applyFixFetcher = useFetcher();
+  const workspaceFetcher = useFetcher<WorkspacePayload & { error?: string }>();
 
   const isFreePlan = !plan || plan === "free";
   const shopNotifications = notifications;
@@ -218,6 +217,24 @@ export default function ComplianceDashboardPage() {
       stopProgressInterval();
     };
   }, [clearReplayTimers, stopProgressInterval]);
+
+  useEffect(() => {
+    if (workspaceFetcher.state !== "idle") {
+      setWorkspaceLoading(true);
+    } else {
+      setWorkspaceLoading(false);
+    }
+  }, [workspaceFetcher.state]);
+
+  useEffect(() => {
+    if (!workspaceFetcher.data) return;
+    if (workspaceFetcher.data.error) {
+      triggerToast(workspaceFetcher.data.error);
+      setWorkspacePayload(undefined);
+      return;
+    }
+    setWorkspacePayload(workspaceFetcher.data as WorkspacePayload);
+  }, [workspaceFetcher.data, triggerToast]);
 
   useEffect(() => {
     if (runScanFetcher.state === "submitting" && runScanFetcher.formData?.get("intent") === "startScan") {
@@ -308,21 +325,6 @@ export default function ComplianceDashboardPage() {
     }
   }, [scheduleFetcher.state, scheduleFetcher.data, triggerToast]);
 
-  useEffect(() => {
-    if (applyFixFetcher.state === "idle") {
-      if (applyFixFetcher.data?.success) {
-        triggerToast("Product updated");
-        setPendingApplyProductId(null);
-      } else if (applyFixFetcher.data?.error) {
-        triggerToast(applyFixFetcher.data.error);
-        setPendingApplyProductId(null);
-      }
-    } else if (applyFixFetcher.state === "submitting") {
-      const productId = applyFixFetcher.formData?.get("productId")?.toString() ?? null;
-      setPendingApplyProductId(productId);
-    }
-  }, [applyFixFetcher.state, applyFixFetcher.data, triggerToast]);
-
   const summaryMetrics = useMemo(() => buildSummary(scanHistory), [scanHistory]);
   const historyByProduct = useMemo(() => groupHistory(localHistory), [localHistory]);
 
@@ -374,20 +376,6 @@ export default function ComplianceDashboardPage() {
     </Popover>
   );
 
-  const handlePreview = useCallback((result: ComplianceFinding) => {
-    setPreviewProduct(result);
-    setPreviewContent(result.aiRewrite?.description ?? result.originalDescription);
-    setManualEditEnabled(false);
-  }, []);
-
-  const handleApplyFix = useCallback(
-    (product: ComplianceFinding, usePreview = false) => {
-      const description = usePreview ? previewContent : product.aiRewrite?.description ?? product.originalDescription;
-      applyFixFetcher.submit({ productId: product.productId, description }, { method: "post", action: "/api/scan/apply" });
-    },
-    [applyFixFetcher, previewContent],
-  );
-
   const handleSchedule = useCallback(
     (productId: string, frequency: "daily" | "weekly" | "monthly") => {
       const formData = new FormData();
@@ -409,38 +397,145 @@ export default function ComplianceDashboardPage() {
     window.open(url.toString(), "_blank");
   }, []);
 
-  const handleApplyAll = useCallback(
-    async (scan: SerializedScan | undefined) => {
-      if (!scan || typeof window === "undefined") return;
-      const payloads = scan.results.filter((result) => result.aiRewrite?.description);
-      if (!payloads.length) {
-        triggerToast("No AI fixes available");
-        return;
+  const workspaceUrl = useCallback(
+    (productId: string, scopeOverride?: FixScope) => {
+      const params = new URLSearchParams({
+        productId,
+        market,
+        scope: scopeOverride ?? workspaceScope,
+      });
+      if (displayedScan?.id) {
+        params.set("scanId", displayedScan.id);
       }
-      setBulkApplying(true);
+      return `/api/ai/fix?${params.toString()}`;
+    },
+    [market, workspaceScope, displayedScan?.id],
+  );
+
+  const openWorkspace = useCallback(
+    (finding: ComplianceFinding) => {
+      setWorkspaceOpen(true);
+      setWorkspaceProductId(finding.productId);
+      setWorkspaceScope("all");
+      setApplyAllState({ running: false, current: 0, total: 0, label: "" });
+      workspaceFetcher.load(workspaceUrl(finding.productId, "all"));
+    },
+    [workspaceFetcher, workspaceUrl],
+  );
+
+  const handleWorkspaceScopeChange = useCallback(
+    (nextScope: FixScope) => {
+      if (!workspaceProductId) return;
+      setWorkspaceScope(nextScope);
+      workspaceFetcher.load(workspaceUrl(workspaceProductId, nextScope));
+    },
+    [workspaceProductId, workspaceFetcher, workspaceUrl],
+  );
+
+  const submitWorkspaceAction = useCallback(
+    async (payload: Record<string, unknown>) => {
+      const response = await fetch("/api/ai/fix", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error || "Workspace request failed");
+      }
+      return data;
+    },
+    [],
+  );
+
+  const updateWorkspaceIssue = useCallback((issueId: string, updater: (issue: WorkspaceIssue) => WorkspaceIssue) => {
+    setWorkspacePayload((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        issues: prev.issues.map((issue) => (issue.id === issueId ? updater(issue) : issue)),
+      };
+    });
+  }, []);
+
+  const handleApplyWorkspaceIssue = useCallback(
+    async (issue: WorkspaceIssue) => {
+      if (!workspaceProductId) return { success: false };
       try {
-        await Promise.all(
-          payloads.map((result) =>
-            fetch("/api/scan/apply", {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: new URLSearchParams({
-                productId: result.productId,
-                description: result.aiRewrite!.description ?? result.originalDescription,
-              }).toString(),
-            }),
-          ),
-        );
-        triggerToast("AI fixes queued");
+        const result = await submitWorkspaceAction({
+          intent: "applySingle",
+          issue,
+          productId: workspaceProductId,
+          market,
+          scanId: displayedScan?.id,
+          scope: workspaceScope,
+        });
+        updateWorkspaceIssue(issue.id, (current) => ({ ...current, status: result.success ? "applied" : current.status, errorMessage: result.error }));
+        triggerToast(result.success ? "Fix applied" : result.error);
+        return result;
       } catch (error) {
-        console.error(error);
-        triggerToast("Unable to apply all fixes");
-      } finally {
-        setBulkApplying(false);
+        const message = error instanceof Error ? error.message : "Failed to apply fix";
+        updateWorkspaceIssue(issue.id, (current) => ({ ...current, status: "error", errorMessage: message }));
+        triggerToast(message);
+        return { success: false, error: message };
       }
     },
-    [triggerToast],
+    [workspaceProductId, submitWorkspaceAction, market, displayedScan?.id, workspaceScope, updateWorkspaceIssue, triggerToast],
   );
+
+  const handleRegenerateWorkspaceIssue = useCallback(
+    async (issue: WorkspaceIssue) => {
+      if (!workspaceProductId) return issue;
+      try {
+        const result = await submitWorkspaceAction({
+          intent: "regenerate",
+          issue,
+          productId: workspaceProductId,
+          market,
+        });
+        const updatedIssue = result.issue as WorkspaceIssue;
+        updateWorkspaceIssue(issue.id, () => updatedIssue);
+        triggerToast("AI suggestion regenerated");
+        return updatedIssue;
+      } catch (error) {
+        triggerToast(error instanceof Error ? error.message : "Unable to regenerate fix");
+        return issue;
+      }
+    },
+    [workspaceProductId, submitWorkspaceAction, market, updateWorkspaceIssue, triggerToast],
+  );
+
+  const handleApplyAllWorkspaceIssues = useCallback(async () => {
+    if (!workspacePayload || !workspaceProductId) return;
+    const pendingIssues = workspacePayload.issues.filter((issue) => issue.status !== "applied");
+    if (!pendingIssues.length) {
+      triggerToast("All issues are already resolved");
+      return;
+    }
+    setApplyAllState({ running: true, current: 0, total: pendingIssues.length, label: "Starting fixes…" });
+    for (let index = 0; index < pendingIssues.length; index += 1) {
+      setApplyAllState({
+        running: true,
+        current: index,
+        total: pendingIssues.length,
+        label: `Applying fix ${index + 1} of ${pendingIssues.length}…`,
+      });
+      await handleApplyWorkspaceIssue(pendingIssues[index]);
+      setApplyAllState({
+        running: true,
+        current: index + 1,
+        total: pendingIssues.length,
+        label: `Applying fix ${index + 1} of ${pendingIssues.length}…`,
+      });
+    }
+    setApplyAllState({ running: false, current: pendingIssues.length, total: pendingIssues.length, label: "All fixes applied" });
+  }, [workspacePayload, workspaceProductId, handleApplyWorkspaceIssue, triggerToast]);
+
+  const closeWorkspace = useCallback(() => {
+    setWorkspaceOpen(false);
+    setWorkspacePayload(undefined);
+    setWorkspaceProductId(null);
+  }, []);
 
   const estimatedSecondsLeft = useMemo(() => {
     if (!isScanning || !totalProducts) return null;
@@ -506,12 +601,20 @@ export default function ComplianceDashboardPage() {
               {isFreePlan ? (
                 <PolarisTooltip content="Upgrade required" dismissOnMouseOut>
                   <span>
-                    <Button disabled>Apply all AI suggestions</Button>
+                    <Button disabled>Launch AI Fix Workspace</Button>
                   </span>
                 </PolarisTooltip>
               ) : (
-                <Button onClick={() => handleApplyAll(displayedScan)} disabled={!displayedScan || bulkApplying}>
-                  {bulkApplying ? "Applying…" : "Apply all AI suggestions"}
+                <Button
+                  onClick={() => {
+                    const firstResult = displayedScan?.results[0];
+                    if (firstResult) {
+                      openWorkspace(firstResult);
+                    }
+                  }}
+                  disabled={!displayedScan?.results?.length}
+                >
+                  Launch AI Fix Workspace
                 </Button>
               )}
             </InlineStack>
@@ -633,8 +736,7 @@ export default function ComplianceDashboardPage() {
                 toggleExpanded={() =>
                   setExpandedHistory((prev) => ({ ...prev, [result.productId]: !prev[result.productId] }))
                 }
-                onPreview={() => handlePreview(result)}
-                onFix={() => handleApplyFix(result)}
+                onOpenWorkspace={() => openWorkspace(result)}
                 onRescan={() => {
                   if (!displayedScan) return;
                   const formData = new FormData();
@@ -644,7 +746,6 @@ export default function ComplianceDashboardPage() {
                   rescanFetcher.submit(formData, { method: "post" });
                 }}
                 onSchedule={(frequency) => handleSchedule(result.productId, frequency)}
-                applying={pendingApplyProductId === result.productId && applyFixFetcher.state !== "idle"}
                 isFreePlan={isFreePlan}
               />
             ))}
@@ -656,52 +757,27 @@ export default function ComplianceDashboardPage() {
         )}
       </Layout.Section>
 
-      <Modal
-        open={Boolean(previewProduct)}
-        onClose={() => setPreviewProduct(null)}
-        title={previewProduct ? `AI Fix Preview — ${previewProduct.productTitle}` : "AI Fix Preview"}
-        large
-        primaryAction={{
-          content: "Apply Fix",
-          disabled: !previewProduct,
-          onAction: () => {
-            if (!previewProduct) return;
-            handleApplyFix(previewProduct, true);
-            setPreviewProduct(null);
-          },
+      <AIFixWorkspace
+        open={workspaceOpen}
+        loading={workspaceLoading}
+        scope={workspaceScope}
+        payload={workspacePayload}
+        shopDomain={shop}
+        onClose={closeWorkspace}
+        onScopeChange={handleWorkspaceScopeChange}
+        onApplyIssue={handleApplyWorkspaceIssue}
+        onRegenerateIssue={handleRegenerateWorkspaceIssue}
+        onApplyAll={handleApplyAllWorkspaceIssues}
+        onRescan={() => {
+          if (!workspaceProductId || !displayedScan) return;
+          const formData = new FormData();
+          formData.append("intent", "rescanProduct");
+          formData.append("productId", workspaceProductId);
+          formData.append("scanId", displayedScan.id);
+          rescanFetcher.submit(formData, { method: "post" });
         }}
-        secondaryActions={[{ content: "Cancel", onAction: () => setPreviewProduct(null) }]}
-      >
-        <Modal.Section>
-          {previewProduct ? (
-            <Stack vertical spacing="400">
-              <Card title="Original snippet">
-                <Text as="p" tone="subdued">
-                  {previewProduct.originalDescription || "No description available."}
-                </Text>
-              </Card>
-              <Card title="AI rewrite">
-                <Stack vertical spacing="300">
-                  <Checkbox
-                    label="Allow manual edits"
-                    checked={manualEditEnabled}
-                    onChange={(value) => setManualEditEnabled(value)}
-                  />
-                  <TextField
-                    value={previewContent}
-                    onChange={setPreviewContent}
-                    multiline
-                    autoComplete="off"
-                    disabled={!manualEditEnabled}
-                  />
-                </Stack>
-              </Card>
-            </Stack>
-          ) : (
-            <Text tone="subdued">Select a product to preview AI fixes.</Text>
-          )}
-        </Modal.Section>
-      </Modal>
+        applyAllProgress={applyAllState}
+      />
     </Layout>
   );
 }
@@ -744,11 +820,9 @@ function ProductResultCard({
   schedule,
   expanded,
   toggleExpanded,
-  onPreview,
-  onFix,
+  onOpenWorkspace,
   onRescan,
   onSchedule,
-  applying,
   isFreePlan,
 }: {
   shopDomain: string;
@@ -757,11 +831,9 @@ function ProductResultCard({
   schedule?: { productId: string; frequency: string; nextRun: string | Date | null };
   expanded: boolean;
   toggleExpanded: () => void;
-  onPreview: () => void;
-  onFix: () => void;
+  onOpenWorkspace: () => void;
   onRescan: () => void;
   onSchedule: (frequency: "daily" | "weekly" | "monthly") => void;
-  applying: boolean;
   isFreePlan: boolean;
 }) {
   const hasViolations = result.violations.length > 0;
@@ -855,18 +927,8 @@ function ProductResultCard({
 
         <InlineStack align="space-between" blockAlign="center">
           <InlineStack gap="200" wrap>
-            <Button size="slim" onClick={onFix} disabled={!result.aiRewrite || applying}>
-              {applying ? (
-                <InlineStack gap="100" blockAlign="center">
-                  <Spinner size="small" />
-                  <span>Fixing…</span>
-                </InlineStack>
-              ) : (
-                "Fix with AI"
-              )}
-            </Button>
-            <Button size="slim" onClick={onPreview} disabled={!result.aiRewrite}>
-              Preview fix
+            <Button size="slim" onClick={onOpenWorkspace}>
+              Fix with AI
             </Button>
             <Button size="slim" onClick={onRescan}>
               Rescan product

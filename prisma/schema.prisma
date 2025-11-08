@@ -84,12 +84,33 @@ model ProductScanHistory {
   market          String
   complianceScore Float
   violations      Int
+  totalIssues     Int?
+  resolvedIssues  Int?
+  scopeUsed       String?
+  aiConfidenceAvg Float?
+  issues          Json?
   scannedAt       DateTime @default(now())
 
   scan Scan @relation(fields: [scanId], references: [id], onDelete: Cascade)
 
   @@index([productId, market])
   @@index([shopDomain, market])
+}
+
+model FixLog {
+  id             String   @id @default(cuid())
+  shopDomain     String
+  productId      String
+  issueId        String
+  fixType        String
+  fieldUpdated   String
+  scopeUsed      String
+  aiModelVersion String?
+  market         String
+  status         String   @default("pending")
+  errorMessage   String?
+  appliedAt      DateTime @default(now())
+  metadata       Json?
 }
 
 model ScanSchedule {

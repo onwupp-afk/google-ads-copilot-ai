@@ -332,6 +332,15 @@ async function persistScanArtifacts(
         market,
         complianceScore: finding.complianceScore,
         violations: finding.violations.length,
+        totalIssues: finding.violations.length,
+        resolvedIssues: 0,
+        scopeUsed: "full_scan",
+        aiConfidenceAvg:
+          finding.violations.length
+            ? finding.violations.reduce((sum, violation) => sum + violation.riskScore, 0) /
+              finding.violations.length
+            : 0,
+        issues: finding.violations,
       })),
     }),
   );
