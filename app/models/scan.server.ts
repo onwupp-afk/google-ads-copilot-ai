@@ -82,7 +82,8 @@ export type ComplianceFinding = {
   shopDomain: string;
   violations: ComplianceViolation[];
   complianceScore: number;
-  status: "flagged" | "clean";
+  status: "flagged" | "clean" | "error";
+  errorMessage?: string;
   aiRewrite?: {
     title?: string;
     description?: string;
@@ -389,6 +390,11 @@ async function analyzeProduct({
 
   const combinedViolations = dedupeViolations([...heuristicViolations, ...aiAnalysis.violations]);
   const complianceScore = calculateComplianceScore(combinedViolations);
+  const status: "flagged" | "clean" | "error" = aiAnalysis.errorMessage
+    ? "error"
+    : combinedViolations.length
+      ? "flagged"
+      : "clean";
 
   return {
     productId: product.id,
@@ -402,7 +408,8 @@ async function analyzeProduct({
     shopDomain,
     violations: combinedViolations,
     complianceScore,
-    status: combinedViolations.length ? "flagged" : "clean",
+    status,
+    errorMessage: aiAnalysis.errorMessage,
     aiRewrite: aiAnalysis.rewrite,
   };
 }
@@ -454,54 +461,68 @@ async function buildAiAnalysis({
   description: string;
   url?: string | null;
   policyHints: string[];
-}): Promise<{ violations: ComplianceViolation[]; rewrite?: { title?: string; description?: string } }> {
+}): Promise<{
+  violations: ComplianceViolation[];
+  rewrite?: { title?: string; description?: string };
+  errorMessage?: string;
+}> {
   if (!openAiClient) return { violations: [] };
 
   const lawReference = getMarketLawReference(market);
   const truncatedDescription = description.slice(0, 3500);
   const hints = policyHints.slice(0, 6).join("\n");
+  let lastError: unknown;
 
-  try {
-    const completion = await openAiClient.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a compliance analyst for Shopify merchants. Compare product data to Google Ads policies and the specified market's ecommerce laws. Return structured JSON only.",
-        },
-        {
-          role: "user",
-          content: `Market: ${market.toUpperCase()}
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const completion = await openAiClient.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a compliance analyst for Shopify merchants. Compare product data to Google Ads policies and the specified market's ecommerce laws. Return structured JSON only.",
+          },
+          {
+            role: "user",
+            content: `Market: ${market.toUpperCase()}
 Local law focus: ${lawReference.law}
 Product title: ${productTitle}
 Product description: ${truncatedDescription}
 Product URL: ${url ?? "N/A"}
 Known heuristic flags: ${hints || "None"}
 Return JSON {"violations":[{"issue":"","policy":"","law":"","severity":"High|Medium|Low","riskScore":0-1,"suggestion":"","whyMatters":"","ruleRef":"","sourceUrl":"","policyUrl":""}],"rewrite":{"title":"","description":""}}.`,
-        },
-      ],
-    });
+          },
+        ],
+      });
 
-    const content = completion.choices?.[0]?.message?.content;
-    if (!content) return { violations: [] };
-    const parsed = JSON.parse(content);
-    const violations = Array.isArray(parsed.violations)
-      ? parsed.violations
-          .map((violation: any) => normalizeViolation(violation, market))
-          .filter((violation): violation is ComplianceViolation => Boolean(violation.issue))
-      : [];
+      const content = completion.choices?.[0]?.message?.content;
+      if (!content) return { violations: [] };
+      const parsed = JSON.parse(content);
+      const violations = Array.isArray(parsed.violations)
+        ? parsed.violations
+            .map((violation: any) => normalizeViolation(violation, market))
+            .filter((violation): violation is ComplianceViolation => Boolean(violation.issue))
+        : [];
 
-    return {
-      violations,
-      rewrite: parsed.rewrite,
-    };
-  } catch (error) {
-    console.error("OpenAI violation generation failed", error);
-    return { violations: [] };
+      return {
+        violations,
+        rewrite: parsed.rewrite,
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        const backoff = 500 * 2 ** attempt;
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        continue;
+      }
+    }
   }
+
+  console.error("OpenAI violation generation failed", lastError);
+  return { violations: [], errorMessage: "AI scan failed. Please retry." };
 }
 
 function dedupeViolations(violations: ComplianceViolation[]) {

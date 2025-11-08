@@ -1,15 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
-import {
-  useFetcher,
-  useLoaderData,
-} from "@remix-run/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useFetcher, useLoaderData } from "@remix-run/react";
 import { Toast } from "@shopify/app-bridge/actions";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import {
@@ -21,6 +13,7 @@ import {
   ButtonGroup,
   Card,
   Checkbox,
+  Collapsible,
   Divider,
   Icon,
   InlineGrid,
@@ -30,12 +23,12 @@ import {
   Link,
   Modal,
   Popover,
+  ProgressBar,
   Select,
-  SkeletonBodyText,
-  SkeletonDisplayText,
   Spinner,
   Text,
   TextField,
+  Thumbnail,
   Tooltip as PolarisTooltip,
 } from "@shopify/polaris";
 import {
@@ -46,14 +39,7 @@ import {
   ProductIcon,
   RefreshIcon,
 } from "@shopify/polaris-icons";
-import {
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip as RechartsTooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { AnimatePresence, motion } from "framer-motion";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import {
@@ -66,13 +52,9 @@ import {
   type SerializedScan,
 } from "../models/scan.server";
 
-const RESULTS_PER_PAGE = 25;
-
-type ProductHistoryPoint = {
-  productId: string;
-  scannedAt: string;
-  complianceScore: number;
-};
+const RESULTS_PER_PAGE = 8;
+const PROGRESS_WAIT_LIMIT = 70;
+const PROGRESS_INTERVAL_MS = 800;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -107,11 +89,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const market = (formData.get("market")?.toString() ?? "uk").toLowerCase();
   const productId = formData.get("productId")?.toString();
   const scanId = formData.get("scanId")?.toString();
-  const frequency = formData.get("frequency")?.toString() as
-    | "daily"
-    | "weekly"
-    | "monthly"
-    | undefined;
+  const frequency = formData.get("frequency")?.toString() as "daily" | "weekly" | "monthly" | undefined;
 
   const { admin, session } = await authenticate.admin(request);
 
@@ -144,12 +122,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return json({ error: "Unsupported action" }, { status: 400 });
     }
   } catch (error) {
-    return json(
-      {
-        error: error instanceof Error ? error.message : "Request failed",
-      },
-      { status: 500 },
-    );
+    return json({ error: error instanceof Error ? error.message : "Request failed" }, { status: 500 });
   }
 };
 
@@ -160,15 +133,26 @@ export default function ComplianceDashboardPage() {
   const [market, setMarket] = useState<string>(((scans[0]?.market as string) ?? "uk").toLowerCase());
   const [currentPage, setCurrentPage] = useState(0);
   const [previewProduct, setPreviewProduct] = useState<ComplianceFinding | null>(null);
-  const [previewContent, setPreviewContent] = useState("" );
+  const [previewContent, setPreviewContent] = useState("");
   const [manualEditEnabled, setManualEditEnabled] = useState(false);
-  const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
+  const [expandedHistory, setExpandedHistory] = useState<Record<string, boolean>>({});
   const [notificationPopoverOpen, setNotificationPopoverOpen] = useState(false);
   const [exportPopoverActive, setExportPopoverActive] = useState(false);
   const [scheduleState, setScheduleState] = useState(schedules);
   const [localHistory, setLocalHistory] = useState(history);
   const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
   const [bulkApplying, setBulkApplying] = useState(false);
+  const [scanResults, setScanResults] = useState<Array<ComplianceFinding | null>>(scans[0]?.results ?? []);
+  const [isScanning, setIsScanning] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("Preparing scan…");
+  const [totalProducts, setTotalProducts] = useState(0);
+  const [currentProductIndex, setCurrentProductIndex] = useState(0);
+  const [scanCompleteState, setScanCompleteState] = useState<"idle" | "success" | "error">("idle");
+  const [lastAnimatedScanId, setLastAnimatedScanId] = useState<string | null>(null);
+
+  const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const replayTimeoutsRef = useRef<NodeJS.Timeout[]>([]);
 
   const appBridge = useAppBridge();
 
@@ -178,7 +162,6 @@ export default function ComplianceDashboardPage() {
   const applyFixFetcher = useFetcher();
 
   const isFreePlan = !plan || plan === "free";
-
   const shopNotifications = notifications;
 
   const displayedScan = useMemo(() => {
@@ -196,39 +179,121 @@ export default function ComplianceDashboardPage() {
     [appBridge],
   );
 
-  useEffect(() => {
-    if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
-      setScanHistory((prev) => [runScanFetcher.data!.scan, ...prev].slice(0, 5));
-      setSelectedScanId(runScanFetcher.data.scan.id);
+  const finalizeScan = useCallback(
+    (scan: SerializedScan, toastMessage?: string) => {
+      setScanHistory((prev) => [scan, ...prev].slice(0, 5));
+      setSelectedScanId(scan.id);
       setCurrentPage(0);
       setLocalHistory((prev) => [
         ...prev,
-        ...runScanFetcher.data!.scan.results.map((result) => ({
+        ...scan.results.map((result) => ({
           productId: result.productId,
-          scannedAt: new Date().toISOString(),
+          scannedAt: scan.completedAt ?? new Date().toISOString(),
           complianceScore: result.complianceScore ?? 0,
         })),
       ]);
-      triggerToast(runScanFetcher.data.toast);
+      setScanResults(scan.results);
+      if (toastMessage) {
+        triggerToast(toastMessage);
+      }
+    },
+    [setScanHistory, setSelectedScanId, setCurrentPage, setLocalHistory, triggerToast],
+  );
+
+  const clearReplayTimers = useCallback(() => {
+    replayTimeoutsRef.current.forEach((timer) => clearTimeout(timer));
+    replayTimeoutsRef.current = [];
+  }, []);
+
+  const stopProgressInterval = useCallback(() => {
+    if (progressIntervalRef.current) {
+      clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
     }
-  }, [runScanFetcher.state, runScanFetcher.data, triggerToast]);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearReplayTimers();
+      stopProgressInterval();
+    };
+  }, [clearReplayTimers, stopProgressInterval]);
+
+  useEffect(() => {
+    if (runScanFetcher.state === "submitting" && runScanFetcher.formData?.get("intent") === "startScan") {
+      clearReplayTimers();
+      stopProgressInterval();
+      setIsScanning(true);
+      setScanCompleteState("idle");
+      setProgress(5);
+      setProgressLabel("Preparing scan…");
+      setTotalProducts(0);
+      setCurrentProductIndex(0);
+      setScanResults([]);
+
+      progressIntervalRef.current = setInterval(() => {
+        setProgress((prev) => (prev < PROGRESS_WAIT_LIMIT ? prev + 2 : prev));
+        setProgressLabel("Syncing with Shopify…");
+      }, PROGRESS_INTERVAL_MS);
+    }
+  }, [runScanFetcher.state, runScanFetcher.formData, clearReplayTimers, stopProgressInterval]);
+
+  useEffect(() => {
+    if (!runScanFetcher.data) return;
+
+    if (runScanFetcher.data.error) {
+      stopProgressInterval();
+      clearReplayTimers();
+      setIsScanning(false);
+      setScanCompleteState("error");
+      triggerToast(runScanFetcher.data.error);
+      return;
+    }
+
+    const scan = runScanFetcher.data.scan;
+    if (!scan || scan.id === lastAnimatedScanId) {
+      return;
+    }
+
+    setLastAnimatedScanId(scan.id);
+    stopProgressInterval();
+    clearReplayTimers();
+
+    const total = Math.max(scan.results.length || scan.productsScanned || 1, 1);
+    setTotalProducts(total);
+    setProgress(70);
+    setProgressLabel(`Scanning product 1 of ${total}`);
+    setCurrentProductIndex(0);
+    setScanResults(Array(total).fill(null));
+
+    const stepDelay = 420;
+    scan.results.forEach((result, index) => {
+      const timer = setTimeout(() => {
+        setScanResults((prev) => {
+          const next = [...prev];
+          next[index] = result;
+          return next;
+        });
+        setCurrentProductIndex(index);
+        setProgress(Math.min(98, Math.round(((index + 1) / total) * 100)));
+        setProgressLabel(`Scanning product ${Math.min(index + 1, total)} of ${total}`);
+      }, index * stepDelay);
+      replayTimeoutsRef.current.push(timer);
+    });
+
+    const completionTimer = setTimeout(() => {
+      setProgress(100);
+      setProgressLabel("Scan complete");
+      setIsScanning(false);
+      setScanCompleteState("success");
+      finalizeScan(scan, runScanFetcher.data.toast);
+    }, scan.results.length * stepDelay + 500);
+    replayTimeoutsRef.current.push(completionTimer);
+  }, [runScanFetcher.data, stopProgressInterval, clearReplayTimers, finalizeScan, triggerToast, lastAnimatedScanId]);
 
   useEffect(() => {
     if (rescanFetcher.state === "idle" && rescanFetcher.data?.scan) {
       setScanHistory((prev) => prev.map((scan) => (scan.id === rescanFetcher.data!.scan.id ? rescanFetcher.data!.scan : scan)));
-      if (rescanFetcher.data.rescanProductId) {
-        const updated = rescanFetcher.data.scan.results.find((result) => result.productId === rescanFetcher.data!.rescanProductId);
-        if (updated) {
-          setLocalHistory((prev) => [
-            ...prev,
-            {
-              productId: updated.productId,
-              scannedAt: new Date().toISOString(),
-              complianceScore: updated.complianceScore ?? 0,
-            },
-          ]);
-        }
-      }
       triggerToast(rescanFetcher.data.toast);
     }
   }, [rescanFetcher.state, rescanFetcher.data, triggerToast]);
@@ -236,7 +301,7 @@ export default function ComplianceDashboardPage() {
   useEffect(() => {
     if (scheduleFetcher.state === "idle" && scheduleFetcher.data?.schedule) {
       setScheduleState((prev) => {
-        const filtered = prev.filter((item) => !(item.productId === scheduleFetcher.data!.schedule.productId));
+        const filtered = prev.filter((item) => item.productId !== scheduleFetcher.data!.schedule.productId);
         return [...filtered, scheduleFetcher.data.schedule];
       });
       triggerToast(scheduleFetcher.data.toast);
@@ -254,13 +319,22 @@ export default function ComplianceDashboardPage() {
   }, [applyFixFetcher.state, applyFixFetcher.data, triggerToast]);
 
   const summaryMetrics = useMemo(() => buildSummary(scanHistory), [scanHistory]);
-  const chartHistoryByProduct = useMemo(() => groupHistory(localHistory), [localHistory]);
+  const historyByProduct = useMemo(() => groupHistory(localHistory), [localHistory]);
+
+  const activeResults = useMemo(() => {
+    if (isScanning) {
+      return scanResults.filter(Boolean) as ComplianceFinding[];
+    }
+    if (displayedScan) {
+      return displayedScan.results;
+    }
+    return [];
+  }, [isScanning, scanResults, displayedScan]);
 
   const visibleResults = useMemo(() => {
-    if (!displayedScan) return [];
     const start = currentPage * RESULTS_PER_PAGE;
-    return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
-  }, [displayedScan, currentPage]);
+    return activeResults.slice(start, start + RESULTS_PER_PAGE);
+  }, [activeResults, currentPage]);
 
   const scanHistoryOptions = scanHistory.map((scan) => ({
     label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
@@ -268,7 +342,9 @@ export default function ComplianceDashboardPage() {
   }));
 
   const notificationsActivator = (
-    <Button icon={NotificationIcon} onClick={() => setNotificationPopoverOpen((prev) => !prev)}>{shopNotifications.length}</Button>
+    <Button icon={NotificationIcon} onClick={() => setNotificationPopoverOpen((prev) => !prev)}>
+      {shopNotifications.length}
+    </Button>
   );
 
   const exportButton = (
@@ -288,10 +364,7 @@ export default function ComplianceDashboardPage() {
   const exportPopover = (
     <Popover active={exportPopoverActive && !isFreePlan && Boolean(displayedScan)} onClose={() => setExportPopoverActive(false)} activator={exportActivator}>
       <ActionList
-        items={[
-          { content: "Export CSV", onAction: () => handleExport(displayedScan, "csv") },
-          { content: "Export PDF", onAction: () => handleExport(displayedScan, "pdf") },
-        ]}
+        items={[{ content: "Export CSV", onAction: () => handleExport(displayedScan, "csv") }, { content: "Export PDF", onAction: () => handleExport(displayedScan, "pdf") }]}
       />
     </Popover>
   );
@@ -304,9 +377,7 @@ export default function ComplianceDashboardPage() {
 
   const handleApplyFix = useCallback(
     (product: ComplianceFinding, usePreview = false) => {
-      const description = usePreview
-        ? previewContent
-        : product.aiRewrite?.description ?? product.originalDescription;
+      const description = usePreview ? previewContent : product.aiRewrite?.description ?? product.originalDescription;
       applyFixFetcher.submit({ productId: product.productId, description }, { method: "post", action: "/api/scan/apply" });
     },
     [applyFixFetcher, previewContent],
@@ -366,16 +437,16 @@ export default function ComplianceDashboardPage() {
     [triggerToast],
   );
 
+  const estimatedSecondsLeft = useMemo(() => {
+    if (!isScanning || !totalProducts) return null;
+    const remaining = Math.max(totalProducts - currentProductIndex - 1, 0);
+    return Math.ceil(remaining * 0.6);
+  }, [isScanning, totalProducts, currentProductIndex]);
+
   return (
     <Layout>
       <Layout.Section>
-        <Box
-          background="bg-surface-secondary"
-          borderRadius="300"
-          padding="400"
-          shadow="card"
-          style={{ position: "sticky", top: 0, zIndex: 10 }}
-        >
+        <Box background="bg-surface-secondary" borderRadius="300" padding="400" shadow="card" style={{ position: "sticky", top: 0, zIndex: 10 }}>
           <Stack spacing="400">
             <InlineStack align="space-between" blockAlign="center">
               <div>
@@ -388,18 +459,12 @@ export default function ComplianceDashboardPage() {
               </div>
               <InlineStack gap="200" blockAlign="center">
                 {exportPopover}
-                <Popover
-                  active={notificationPopoverOpen}
-                  activator={notificationsActivator}
-                  onClose={() => setNotificationPopoverOpen(false)}
-                >
+                <Popover active={notificationPopoverOpen} activator={notificationsActivator} onClose={() => setNotificationPopoverOpen(false)}>
                   <Box padding="300" minWidth="320px">
                     <Text variant="headingSm">Alerts</Text>
                     <Divider borderColor="border" style={{ margin: "var(--p-space-200) 0" }} />
                     <Stack vertical spacing="200">
-                      {shopNotifications.length === 0 && (
-                        <Text tone="subdued">No alerts right now.</Text>
-                      )}
+                      {shopNotifications.length === 0 && <Text tone="subdued">No alerts right now.</Text>}
                       {shopNotifications.map((notification) => (
                         <Stack key={notification.id} vertical spacing="100">
                           <InlineStack gap="200" blockAlign="center">
@@ -419,24 +484,9 @@ export default function ComplianceDashboardPage() {
             </InlineStack>
 
             <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
-              <SummaryMetricCard
-                title="Compliance score"
-                icon={CheckCircleIcon}
-                value={`${summaryMetrics.overallScore}%`}
-                description="Weighted by recent scans"
-              />
-              <SummaryMetricCard
-                title="Violations this week"
-                icon={AlertCircleIcon}
-                value={summaryMetrics.violationsThisWeek.toString()}
-                description="Across all markets"
-              />
-              <SummaryMetricCard
-                title="Scheduled products"
-                icon={CalendarCheckIcon}
-                value={scheduleState.length.toString()}
-                description="Auto rescans enabled"
-              />
+              <SummaryMetricCard title="Compliance score" icon={CheckCircleIcon} value={`${summaryMetrics.overallScore}%`} description="Weighted by recent scans" />
+              <SummaryMetricCard title="Violations this week" icon={AlertCircleIcon} value={summaryMetrics.violationsThisWeek.toString()} description="Across all markets" />
+              <SummaryMetricCard title="Scheduled products" icon={CalendarCheckIcon} value={scheduleState.length.toString()} description="Auto rescans enabled" />
             </InlineGrid>
 
             <InlineStack gap="200" wrap blockAlign="center">
@@ -447,13 +497,7 @@ export default function ComplianceDashboardPage() {
                   {runScanFetcher.state !== "idle" ? "Scanning…" : "Rescan all products"}
                 </Button>
               </runScanFetcher.Form>
-              <Select
-                labelHidden
-                label="Market"
-                options={MARKETS}
-                value={market}
-                onChange={(value) => setMarket(value)}
-              />
+              <Select labelHidden label="Market" options={MARKETS} value={market} onChange={(value) => setMarket(value)} />
               {isFreePlan ? (
                 <PolarisTooltip content="Upgrade required" dismissOnMouseOut>
                   <span>
@@ -461,10 +505,7 @@ export default function ComplianceDashboardPage() {
                   </span>
                 </PolarisTooltip>
               ) : (
-                <Button
-                  onClick={() => handleApplyAll(displayedScan)}
-                  disabled={!displayedScan || bulkApplying}
-                >
+                <Button onClick={() => handleApplyAll(displayedScan)} disabled={!displayedScan || bulkApplying}>
                   {bulkApplying ? "Applying…" : "Apply all AI suggestions"}
                 </Button>
               )}
@@ -482,6 +523,52 @@ export default function ComplianceDashboardPage() {
       )}
 
       <Layout.Section>
+        <AnimatePresence>
+          {isScanning && (
+            <motion.div key="scan-progress" initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <Card>
+                <Stack vertical spacing="300">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text variant="bodyMd">{progressLabel}</Text>
+                    <Text tone="subdued">{progress}%</Text>
+                  </InlineStack>
+                  <ProgressBar progress={progress} size="small" tone="primary" />
+                  {totalProducts > 0 && (
+                    <InlineStack gap="200" blockAlign="center">
+                      <Text tone="subdued">
+                        Scanning product {Math.min(currentProductIndex + 1, totalProducts)} of {totalProducts}
+                      </Text>
+                      {estimatedSecondsLeft !== null && <Text tone="subdued">Estimated time left {estimatedSecondsLeft}s</Text>}
+                    </InlineStack>
+                  )}
+                </Stack>
+              </Card>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        {!isScanning && scanCompleteState === "success" && (
+          <motion.div key="scan-success" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+            <Card subdued>
+              <InlineStack gap="200" blockAlign="center">
+                <Icon source={CheckCircleIcon} tone="success" />
+                <Text>Scan complete — results updated below.</Text>
+              </InlineStack>
+            </Card>
+          </motion.div>
+        )}
+        {!isScanning && scanCompleteState === "error" && (
+          <motion.div key="scan-error" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }}>
+            <Card subdued>
+              <InlineStack gap="200" blockAlign="center">
+                <Icon source={AlertCircleIcon} tone="critical" />
+                <Text>Scan failed — please try again.</Text>
+              </InlineStack>
+            </Card>
+          </motion.div>
+        )}
+      </Layout.Section>
+
+      <Layout.Section>
         <Card>
           <Stack spacing="400">
             <Select
@@ -494,50 +581,52 @@ export default function ComplianceDashboardPage() {
               }}
               placeholder="Most recent"
             />
-            {displayedScan && (
-              <InlineStack align="space-between" blockAlign="center">
-                <Text tone="subdued">
-                  Completed {formatTimestamp(displayedScan.completedAt ?? displayedScan.startedAt)} — Market {displayedScan.market.toUpperCase()}
-                </Text>
-                {displayedScan.results.length > RESULTS_PER_PAGE && (
-                  <InlineStack gap="200" blockAlign="center">
-                    <ButtonGroup>
-                      <Button onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 0))} disabled={currentPage === 0}>
-                        Previous
-                      </Button>
-                      <Button
-                        onClick={() => setCurrentPage((prev) =>
-                          displayedScan ? Math.min(prev + 1, Math.ceil(displayedScan.results.length / RESULTS_PER_PAGE) - 1) : prev,
-                        )}
-                        disabled={!displayedScan || (currentPage + 1) * RESULTS_PER_PAGE >= displayedScan.results.length}
-                      >
-                        Next
-                      </Button>
-                    </ButtonGroup>
-                    <Text tone="subdued">
-                      Page {currentPage + 1} / {Math.max(1, Math.ceil(displayedScan.results.length / RESULTS_PER_PAGE))}
-                    </Text>
-                  </InlineStack>
-                )}
-              </InlineStack>
-            )}
+            <InlineStack align="space-between" blockAlign="center">
+              <Text tone="subdued">
+                {displayedScan
+                  ? `Completed ${formatTimestamp(displayedScan.completedAt ?? displayedScan.startedAt)} • Market ${displayedScan.market.toUpperCase()}`
+                  : "No scans yet."}
+              </Text>
+              {activeResults.length > RESULTS_PER_PAGE && (
+                <InlineStack gap="200" blockAlign="center">
+                  <ButtonGroup>
+                    <Button onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 0))} disabled={currentPage === 0}>
+                      Previous
+                    </Button>
+                    <Button
+                      onClick={() =>
+                        setCurrentPage((prev) =>
+                          Math.min(prev + 1, Math.ceil(activeResults.length / RESULTS_PER_PAGE) - 1),
+                        )
+                      }
+                      disabled={(currentPage + 1) * RESULTS_PER_PAGE >= activeResults.length}
+                    >
+                      Next
+                    </Button>
+                  </ButtonGroup>
+                  <Text tone="subdued">
+                    Page {currentPage + 1} / {Math.max(1, Math.ceil(activeResults.length / RESULTS_PER_PAGE))}
+                  </Text>
+                </InlineStack>
+              )}
+            </InlineStack>
           </Stack>
         </Card>
       </Layout.Section>
 
       <Layout.Section>
-        {displayedScan ? (
+        {visibleResults.length ? (
           <Stack vertical spacing="400">
             {visibleResults.map((result) => (
               <ProductResultCard
                 key={result.productId}
                 shopDomain={shop}
                 result={result}
-                history={chartHistoryByProduct[result.productId] ?? []}
+                history={historyByProduct[result.productId] ?? []}
                 schedule={scheduleState.find((schedule) => schedule.productId === result.productId)}
-                expanded={Boolean(expandedProducts[result.productId])}
+                expanded={Boolean(expandedHistory[result.productId])}
                 toggleExpanded={() =>
-                  setExpandedProducts((prev) => ({ ...prev, [result.productId]: !prev[result.productId] }))
+                  setExpandedHistory((prev) => ({ ...prev, [result.productId]: !prev[result.productId] }))
                 }
                 onPreview={() => handlePreview(result)}
                 onFix={() => handleApplyFix(result)}
@@ -583,7 +672,7 @@ export default function ComplianceDashboardPage() {
             <Stack vertical spacing="400">
               <Card title="Original snippet">
                 <Text as="p" tone="subdued">
-                  {previewProduct.originalDescription}
+                  {previewProduct.originalDescription || "No description available."}
                 </Text>
               </Card>
               <Card title="AI rewrite">
@@ -672,33 +761,95 @@ function ProductResultCard({
 }) {
   const hasViolations = result.violations.length > 0;
   const highestSeverity = getHighestSeverity(result.violations);
-  const summaryBadgeTone = hasViolations ? severityTone(highestSeverity) : "success";
-  const summaryLabel = hasViolations ? `${result.violations.length} flagged` : "Clean";
+  const complianceTone = result.complianceScore >= 90 ? "success" : result.complianceScore >= 70 ? "warning" : "critical";
+  const statusBadge = hasViolations ? `${result.violations.length} issue${result.violations.length === 1 ? "" : "s"}` : "Clean";
+  const productUrl = result.legacyResourceId
+    ? `https://${shopDomain}/admin/products/${result.legacyResourceId}`
+    : result.productHandle
+      ? `https://${shopDomain}/admin/products?search=${result.productHandle}`
+      : undefined;
+  const showError = (result as any).errorMessage || result.status === "error";
+
+  const thumbnail = result.thumbnailUrl ? (
+    <Thumbnail source={result.thumbnailUrl} alt={result.productTitle} size="large" />
+  ) : (
+    <Thumbnail source={ProductIcon} alt="Product" size="large" />
+  );
 
   return (
-    <Card sectioned>
+    <Card>
       <Stack vertical spacing="300">
-        <InlineStack align="space-between" blockAlign="center">
-          <InlineStack gap="200" blockAlign="center">
-            <Icon source={ProductIcon} tone="subdued" />
+        <InlineStack align="space-between" blockAlign="start">
+          <InlineStack gap="300" wrap blockAlign="center">
+            {thumbnail}
             <div>
-              <Text variant="headingSm" as="h3">
-                {result.productTitle}
-              </Text>
-              <Text tone="subdued" as="p">
-                {shopDomain}
-              </Text>
+              <InlineStack gap="200" wrap blockAlign="center">
+                {productUrl ? (
+                  <Link url={productUrl} target="_blank">
+                    <Text variant="headingSm" as="h3">
+                      {result.productTitle}
+                    </Text>
+                  </Link>
+                ) : (
+                  <Text variant="headingSm" as="h3">
+                    {result.productTitle}
+                  </Text>
+                )}
+                <Badge tone="subdued">Market: {result.market.toUpperCase()}</Badge>
+                <Badge tone={complianceTone}>Score {result.complianceScore}%</Badge>
+              </InlineStack>
+              <Text tone="subdued">{shopDomain}</Text>
             </div>
           </InlineStack>
-          <Badge tone={summaryBadgeTone}>{summaryLabel}</Badge>
+          <Badge tone={hasViolations ? severityTone(highestSeverity) : "success"}>{statusBadge}</Badge>
         </InlineStack>
 
-        <InlineStack align="space-between" blockAlign="start">
-          <InlineStack gap="200" blockAlign="center">
-            <Badge tone="info">Score {result.complianceScore}%</Badge>
-            <Badge tone="subdued">Market {result.market.toUpperCase()}</Badge>
-          </InlineStack>
-          <InlineStack gap="200">
+        {showError && (
+          <Banner status="critical" title="Scan incomplete">
+            <Text as="p" tone="critical">
+              {(result as any).errorMessage ?? "We couldn’t finish scanning this product."}
+            </Text>
+            <Button size="slim" onClick={onRescan}>
+              Retry scan
+            </Button>
+          </Banner>
+        )}
+
+        {!hasViolations && !showError && (
+          <Banner status="success" title="✅ Clean — No issues detected" />
+        )}
+
+        {hasViolations && (
+          <Stack vertical spacing="200">
+            {result.violations.map((violation, index) => (
+              <Box key={`${result.productId}-violation-${index}`} padding="300" background="bg-surface-tertiary" borderRadius="300">
+                <InlineStack align="space-between" blockAlign="center">
+                  <InlineStack gap="200" blockAlign="center">
+                    <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
+                    <Badge tone={riskTone(violation.riskScore)}>Risk {formatRisk(violation.riskScore)}</Badge>
+                  </InlineStack>
+                  {violation.sourceUrl && (
+                    <Link url={violation.sourceUrl} target="_blank">
+                      Policy reference
+                    </Link>
+                  )}
+                </InlineStack>
+                <Text variant="bodyMd" as="p">
+                  <strong>{violation.policy}</strong> · {violation.law}
+                </Text>
+                <Text tone="subdued" as="p">
+                  {violation.issue}
+                </Text>
+                <Text as="p">
+                  <strong>AI guidance:</strong> {violation.suggestion}
+                </Text>
+              </Box>
+            ))}
+          </Stack>
+        )}
+
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="200" wrap>
             <Button size="slim" onClick={onFix} disabled={!result.aiRewrite || applying}>
               {applying ? (
                 <InlineStack gap="100" blockAlign="center">
@@ -716,71 +867,49 @@ function ProductResultCard({
               Rescan product
             </Button>
           </InlineStack>
-        </InlineStack>
-
-        <InlineStack align="space-between" wrap blockAlign="center">
-          <div style={{ minWidth: 200, height: 120 }}>
-            <ProductHistorySparkline data={history} />
-          </div>
           <InlineStack gap="200" blockAlign="center">
             <Select
-              label="Schedule auto-rescan"
+              label="Auto-rescan"
               labelHidden
               options={SCHEDULE_OPTIONS}
               value={schedule?.frequency ?? ""}
-              placeholder="Select frequency"
+              placeholder="Schedule"
               onChange={(value) => onSchedule(value as "daily" | "weekly" | "monthly")}
               disabled={isFreePlan}
             />
             {schedule?.nextRun && (
-              <Text tone="subdued" as="span">
-                Next run {formatTimestamp(schedule.nextRun)}
-              </Text>
+              <Text tone="subdued">Next run {formatTimestamp(schedule.nextRun)}</Text>
             )}
           </InlineStack>
         </InlineStack>
 
-        <Button fullWidth onClick={toggleExpanded} accessibilityLabel="Toggle violation details">
-          {expanded ? "Hide details" : "Show details"}
-        </Button>
-
-        {expanded && (
-          <Stack vertical spacing="200">
-            {hasViolations ? (
-              result.violations.map((violation, index) => (
-                <Card key={`${result.productId}-violation-${index}`} subdued sectioned>
-                  <InlineStack align="space-between" blockAlign="center">
-                    <InlineStack gap="200" blockAlign="center">
-                      <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
-                      <Badge tone={riskTone(violation.riskScore)}>
-                        Risk {formatRisk(violation.riskScore)}
-                      </Badge>
-                    </InlineStack>
-                    {violation.sourceUrl && (
-                      <Link url={violation.sourceUrl} target="_blank">
-                        View policy reference
-                      </Link>
-                    )}
+        <Collapsible open={expanded} id={`${result.productId}-history`}>
+          <Box padding="200" borderRadius="200" background="bg-surface-tertiary">
+            <Text variant="bodySm" tone="subdued">
+              Recent scans
+            </Text>
+            {history.length ? (
+              <Stack spacing="200">
+                {history.slice(-5).map((entry, index) => (
+                  <InlineStack key={`${result.productId}-history-${index}`} align="space-between">
+                    <Text tone="subdued">{formatTimestamp(entry.scannedAt)}</Text>
+                    <Badge tone={entry.complianceScore >= 90 ? "success" : entry.complianceScore >= 70 ? "warning" : "critical"}>
+                      {entry.complianceScore}%
+                    </Badge>
                   </InlineStack>
-                  <Text variant="bodyMd" as="p">
-                    <strong>{violation.policy}</strong> · {violation.law}
-                  </Text>
-                  <Text variant="bodySm" tone="subdued" as="p">
-                    {violation.issue}
-                  </Text>
-                  <Text variant="bodySm" as="p">
-                    <strong>Why this matters:</strong> {violation.whyMatters}
-                  </Text>
-                  <Text variant="bodySm" as="p">
-                    <strong>AI guidance:</strong> {violation.suggestion}
-                  </Text>
-                </Card>
-              ))
+                ))}
+              </Stack>
             ) : (
-              <Text tone="subdued">Everything looks compliant for this product.</Text>
+              <Text tone="subdued">No history yet.</Text>
             )}
-          </Stack>
-        )}
+          </Box>
+        </Collapsible>
+
+        <InlineStack align="center">
+          <Button variant="plain" onClick={toggleExpanded}>
+            {expanded ? "Hide history" : "Show history"}
+          </Button>
+        </InlineStack>
       </Stack>
     </Card>
   );
@@ -830,6 +959,20 @@ const SCHEDULE_OPTIONS = [
   { label: "Monthly", value: "monthly" },
 ];
 
+function formatTimestamp(value: string | Date | null) {
+  if (!value) return "Unknown";
+  return new Date(value).toLocaleString();
+}
+
+function formatRelative(value: string) {
+  const diff = Date.now() - new Date(value).getTime();
+  const mins = Math.round(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
 function buildSummary(scans: SerializedScan[]) {
   if (!scans.length) {
     return { overallScore: 0, violationsThisWeek: 0 };
@@ -846,7 +989,7 @@ function buildSummary(scans: SerializedScan[]) {
   return { overallScore, violationsThisWeek };
 }
 
-function groupHistory(history: ProductHistoryPoint[]) {
+function groupHistory(history: { productId: string; scannedAt: string; complianceScore: number }[]) {
   return history.reduce<Record<string, { scannedAt: string; complianceScore: number }[]>>((acc, item) => {
     if (!acc[item.productId]) acc[item.productId] = [];
     acc[item.productId].push(item);
@@ -875,17 +1018,4 @@ function riskTone(score: number) {
 
 function formatRisk(score: number) {
   return `${Math.round(Math.min(1, Math.max(0, score)) * 100)}%`;
-}
-
-function formatTimestamp(value: string | Date) {
-  return new Date(value).toLocaleString();
-}
-
-function formatRelative(value: string) {
-  const diff = Date.now() - new Date(value).getTime();
-  const mins = Math.round(diff / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
 }
