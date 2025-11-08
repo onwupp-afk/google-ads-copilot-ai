@@ -177,6 +177,8 @@ export default function ComplianceDashboardPage() {
   const [localHistory, setLocalHistory] = useState(history);
   const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
   const [bulkApplying, setBulkApplying] = useState(false);
+  const initialScanResults = scans[0]?.results ?? [];
+  const [scanResults, setScanResults] = useState<ComplianceFinding[]>(initialScanResults);
   const [isScanning, setIsScanning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [totalProducts, setTotalProducts] = useState(0);
@@ -224,61 +226,12 @@ export default function ComplianceDashboardPage() {
           complianceScore: result.complianceScore ?? 0,
         })),
       ]);
+      setScanResults(scan.results);
       if (toastMessage) {
         triggerToast(toastMessage);
       }
     },
     [setScanHistory, setSelectedScanId, setCurrentPage, setLocalHistory, triggerToast],
-  );
-
-  const animateScanProgress = useCallback(
-    (scan: SerializedScan, toastMessage?: string) => {
-      const total = scan.results.length || scan.productsScanned || 1;
-      setTotalProducts(total);
-      setCurrentProductIndex(0);
-      setProgress(5);
-      setProgressLabel("Scanning products…");
-
-      const perProductDelay = 450;
-      const results = scan.results.length
-        ? scan.results
-        : Array.from({ length: total }).map((_, index) => ({
-            productId: `placeholder-${index}`,
-            productTitle: `Product ${index + 1}`,
-            complianceScore: 0,
-            violations: [],
-            status: "flagged",
-            market: scan.market,
-            shopDomain: scan.shopDomain,
-            originalDescription: "",
-            issues: [],
-          } as unknown as ComplianceFinding));
-
-      let index = 0;
-
-      const step = () => {
-        setCurrentProductIndex(index);
-        setProgress(Math.round(((index + 1) / total) * 100));
-        setProgressLabel(`Scanning ${results[index]?.productTitle ?? `product ${index + 1}`}`);
-        index += 1;
-        if (index < total) {
-          setTimeout(step, perProductDelay);
-        } else {
-          setTimeout(() => {
-            setProgress(100);
-            setProgressLabel("Finalizing scan…");
-            finalizeScan(scan, toastMessage);
-            setTimeout(() => {
-              setIsScanning(false);
-              setScanCompleteState("success");
-            }, 400);
-          }, perProductDelay);
-        }
-      };
-
-      step();
-    },
-    [finalizeScan],
   );
 
 useEffect(() => {
@@ -293,17 +246,91 @@ useEffect(() => {
 }, [runScanFetcher.state, runScanFetcher.formData]);
 
 useEffect(() => {
-  if (runScanFetcher.state === "idle") {
-    if (runScanFetcher.data?.scan && runScanFetcher.data.scan.id !== lastAnimatedScanId) {
-      setLastAnimatedScanId(runScanFetcher.data.scan.id);
-      animateScanProgress(runScanFetcher.data.scan, runScanFetcher.data.toast);
-    } else if (runScanFetcher.data?.error) {
+  if (!runScanFetcher.data) {
+    return undefined;
+  }
+
+  if (runScanFetcher.data.error) {
+    if (scanCompleteState !== "error") {
       setIsScanning(false);
       setScanCompleteState("error");
       triggerToast(runScanFetcher.data.error);
     }
+    return undefined;
   }
-}, [runScanFetcher.state, runScanFetcher.data, animateScanProgress, triggerToast, lastAnimatedScanId]);
+
+  const scan = runScanFetcher.data.scan;
+  if (!scan || scan.id === lastAnimatedScanId) {
+    return undefined;
+  }
+
+  setLastAnimatedScanId(scan.id);
+  setIsScanning(true);
+  setScanCompleteState("idle");
+  const total = Math.max(scan.results.length || scan.productsScanned || 1, 1);
+  setTotalProducts(total);
+  setCurrentProductIndex(0);
+  setProgress(0);
+  setProgressLabel("Scanning products…");
+  setScanResults([]);
+
+  const delay = 450;
+  const placeholderResults = scan.results.length
+    ? scan.results
+    : Array.from({ length: total }).map((_, index) => ({
+        productId: `placeholder-${index}`,
+        productTitle: `Product ${index + 1}`,
+        legacyResourceId: undefined,
+        productHandle: null,
+        thumbnailUrl: null,
+        originalDescription: "",
+        originalHtml: undefined,
+        market: scan.market,
+        shopDomain: scan.shopDomain,
+        violations: [],
+        complianceScore: 100,
+        status: "clean",
+      } as ComplianceFinding));
+
+  let cancelled = false;
+  const timeouts: ReturnType<typeof setTimeout>[] = [];
+
+  const step = (index: number) => {
+    if (cancelled) return;
+    const clampedIndex = Math.min(index, total - 1);
+    setCurrentProductIndex(clampedIndex);
+    setProgress(Math.min(100, Math.round(((clampedIndex + 1) / total) * 100)));
+    setProgressLabel(`Scanning product ${Math.min(clampedIndex + 1, total)} of ${total}`);
+    setScanResults(placeholderResults.slice(0, Math.min(clampedIndex + 1, placeholderResults.length)));
+
+    if (clampedIndex + 1 < total) {
+      timeouts.push(setTimeout(() => step(clampedIndex + 1), delay));
+    } else {
+      timeouts.push(
+        setTimeout(() => {
+          if (cancelled) return;
+          finalizeScan(scan, runScanFetcher.data?.toast);
+          setScanResults(scan.results);
+          setIsScanning(false);
+          setScanCompleteState("success");
+        }, delay),
+      );
+    }
+  };
+
+  timeouts.push(setTimeout(() => step(0), 200));
+
+  return () => {
+    cancelled = true;
+    timeouts.forEach(clearTimeout);
+  };
+}, [runScanFetcher.data, finalizeScan, triggerToast, lastAnimatedScanId, scanCompleteState]);
+
+useEffect(() => {
+  if (!isScanning && displayedScan) {
+    setScanResults(displayedScan.results);
+  }
+}, [isScanning, displayedScan]);
 
   useEffect(() => {
     if (rescanFetcher.state === "idle" && rescanFetcher.data?.scan) {
@@ -348,11 +375,16 @@ useEffect(() => {
   const summaryMetrics = useMemo(() => buildSummary(scanHistory), [scanHistory]);
   const chartHistoryByProduct = useMemo(() => groupHistory(localHistory), [localHistory]);
 
+  const activeResults = useMemo(() => {
+    if (isScanning) return scanResults;
+    if (displayedScan) return displayedScan.results;
+    return scanResults;
+  }, [isScanning, scanResults, displayedScan]);
+
   const visibleResults = useMemo(() => {
-    if (!displayedScan) return [];
     const start = currentPage * RESULTS_PER_PAGE;
-    return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
-  }, [displayedScan, currentPage]);
+    return activeResults.slice(start, start + RESULTS_PER_PAGE);
+  }, [activeResults, currentPage]);
 
   const scanHistoryOptions = scanHistory.map((scan) => ({
     label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
@@ -639,7 +671,7 @@ useEffect(() => {
                     <Text variant="bodyMd">{progressLabel}</Text>
                     <Text tone="subdued">{progress}%</Text>
                   </InlineStack>
-                  <ProgressBar progress={progress} size="small" tone="primary" animated />
+                  <ProgressBar progress={progress} size="small" tone="primary" />
                   {totalProducts > 0 && (
                     <InlineStack gap="200" blockAlign="center">
                       <Text tone="subdued">
@@ -670,10 +702,24 @@ useEffect(() => {
             </Card>
           </motion.div>
         )}
+        {!isScanning && scanCompleteState === "error" && (
+          <motion.div
+            key="scan-error"
+            initial={{ opacity: 0, y: -5 }}
+            animate={{ opacity: 1, y: 0 }}
+          >
+            <Card subdued>
+              <InlineStack gap="200" blockAlign="center">
+                <Icon source={AlertCircleIcon} tone="critical" />
+                <Text>Scan failed — please try again.</Text>
+              </InlineStack>
+            </Card>
+          </motion.div>
+        )}
       </Layout.Section>
 
       <Layout.Section>
-        {displayedScan ? (
+        {activeResults.length ? (
           <Stack vertical spacing="400">
             {visibleResults.map((result) => (
               <ProductResultCard
