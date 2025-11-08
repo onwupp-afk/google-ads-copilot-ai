@@ -22,7 +22,6 @@ import {
   SkeletonDisplayText,
   Spinner,
   Text,
-  TextField,
 } from "@shopify/polaris";
 import { AlertCircleIcon, CheckCircleIcon, ProductIcon } from "@shopify/polaris-icons";
 import prisma from "../db.server";
@@ -61,32 +60,27 @@ const PRODUCTS_QUERY = `#graphql
   }
 `;
 
-const PRODUCT_UPDATE_MUTATION = `#graphql
-  mutation UpdateProduct($input: ProductInput!) {
-    productUpdate(input: $input) {
-      product { id }
-      userErrors { field message }
-    }
-  }
-`;
-
-export type PhraseSuggestion = {
-  original: string;
-  replacement: string;
-  reason: string;
-};
+type ScanIntent = "startScan";
 
 export type ComplianceFinding = {
   productId: string;
   legacyResourceId?: string;
   productTitle: string;
   market: string;
-  matchedKeywords: string[];
-  issues: string[];
-  policyArea: string;
-  phrases: PhraseSuggestion[];
+  shopDomain: string;
+  violations: ComplianceViolation[];
   complianceScore: number;
   status: "flagged" | "clean";
+};
+
+export type ComplianceViolation = {
+  issue: string;
+  policy: string;
+  law: string;
+  severity: "High" | "Medium" | "Low";
+  riskScore: number;
+  suggestion: string;
+  sourceUrl?: string;
 };
 
 export type SerializedScan = Omit<Scan, "startedAt" | "completedAt" | "results"> & {
@@ -112,58 +106,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
-  const intent = formData.get("intent");
+  const intent = formData.get("intent")?.toString() as ScanIntent | undefined;
   const market = (formData.get("market")?.toString() ?? "uk").toLowerCase();
-  const productId = formData.get("productId")?.toString();
-  const phrasesPayload = formData.get("phrases")?.toString();
-
   const { admin, session } = await authenticate.admin(request);
-
-  if (intent === "applySuggestion") {
-    if (!productId || !phrasesPayload) {
-      return json({ error: "Missing product or suggestions" }, { status: 400 });
-    }
-
-    let phrases: PhraseSuggestion[] = [];
-    try {
-      phrases = JSON.parse(phrasesPayload) as PhraseSuggestion[];
-    } catch {
-      return json({ error: "Invalid suggestion payload" }, { status: 400 });
-    }
-
-    if (!phrases.length) {
-      return json({ error: "No suggestions to apply" }, { status: 400 });
-    }
-
-    const descriptionResponse = await admin.graphql(
-      `#graphql
-        query ProductDescription($id: ID!) {
-          product(id: $id) {
-            descriptionHtml
-          }
-        }
-      `,
-      { variables: { id: productId } },
-    );
-    const descriptionBody = await descriptionResponse.json();
-    const currentHtml = descriptionBody?.data?.product?.descriptionHtml ?? "";
-    const updatedHtml = applyPhraseSuggestions(currentHtml, phrases);
-
-    const response = await admin.graphql(PRODUCT_UPDATE_MUTATION, {
-      variables: {
-        input: {
-          id: productId,
-          descriptionHtml: updatedHtml,
-        },
-      },
-    });
-    const body = await response.json();
-    const errors = body?.data?.productUpdate?.userErrors;
-    if (errors?.length) {
-      return json({ error: errors[0].message }, { status: 400 });
-    }
-    return json({ applied: true });
-  }
 
   if (intent === "startScan") {
     try {
@@ -184,14 +129,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function AppScansPage() {
   const { scans, aiConnected } = useLoaderData<typeof loader>();
   const runScanFetcher = useFetcher<typeof action>();
-  const applyFetcher = useFetcher<typeof action>();
 
   const [history, setHistory] = useState<SerializedScan[]>(scans);
   const [selectedScanId, setSelectedScanId] = useState<string | null>(scans[0]?.id ?? null);
   const [market, setMarket] = useState<string>("uk");
   const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
-  const [phraseDrafts, setPhraseDrafts] = useState<Record<string, PhraseSuggestion[]>>({});
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
 
@@ -208,36 +150,13 @@ export default function AppScansPage() {
     }
   }, [runScanFetcher.state, runScanFetcher.data]);
 
-  useEffect(() => {
-    if (applyFetcher.state === "idle") {
-      if (applyFetcher.data?.applied) {
-        setStatusMessage("AI suggestion applied to product description");
-      } else if (applyFetcher.data?.error) {
-        setStatusMessage(applyFetcher.data.error);
-      }
-    }
-  }, [applyFetcher.state, applyFetcher.data]);
-
   const displayedScan = useMemo(() => {
+    if (!history.length) return undefined;
     if (!selectedScanId) return history[0];
     return history.find((scan) => scan.id === selectedScanId) ?? history[0];
   }, [history, selectedScanId]);
 
-  useEffect(() => {
-    if (displayedScan) {
-      const drafts: Record<string, PhraseSuggestion[]> = {};
-      displayedScan.results.forEach((result) => {
-        drafts[result.productId] = result.phrases ?? [];
-      });
-      setPhraseDrafts(drafts);
-      setCurrentPage(0);
-    }
-  }, [displayedScan?.id]);
-
   const isScanning = runScanFetcher.state !== "idle";
-  const applyingProductId =
-    applyFetcher.state !== "idle" ? applyFetcher.formData?.get("productId")?.toString() : null;
-
   const scanHistoryOptions = history.map((scan) => ({
     label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
     value: scan.id,
@@ -261,85 +180,59 @@ export default function AppScansPage() {
     return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
   }, [displayedScan, currentPage]);
 
-  const handleReplacementChange = (productId: string, phraseIndex: number, value: string) => {
-    setPhraseDrafts((prev) => {
-      const existing = prev[productId] ? [...prev[productId]] : [];
-      if (!existing[phraseIndex]) return prev;
-      existing[phraseIndex] = { ...existing[phraseIndex], replacement: value };
-      return { ...prev, [productId]: existing };
-    });
-  };
-
-  const rows = visibleResults.map((result) => [
-    <Text key={`${result.productId}-title`} variant="bodyMd">{result.productTitle}</Text>,
-    <div key={`${result.productId}-issues`}>
-      {result.issues.length === 0 ? (
-        <Badge tone="success">Clean</Badge>
+  const rows = visibleResults.map((result) => {
+    const hasViolations = result.violations.length > 0;
+    return [
+      <Stack key={`${result.productId}-product`} vertical spacing="200">
+        <Text variant="bodyMd" as="span">
+          {result.productTitle}
+        </Text>
+        <Text tone="subdued" as="span">
+          {hasViolations ? `${result.violations.length} violation${result.violations.length === 1 ? "" : "s"}` : "Clean"}
+        </Text>
+      </Stack>,
+      hasViolations ? (
+        <Stack key={`${result.productId}-policies`} vertical spacing="200">
+          {result.violations.map((violation, index) => (
+            <div key={`${result.productId}-violation-${index}`}>
+              <InlineStack gap="200" align="space-between">
+                <InlineStack gap="200" blockAlign="center">
+                  <Badge tone={severityTone(violation.severity)}>{violation.severity}</Badge>
+                  <Badge tone={riskTone(violation.riskScore)}>
+                    Risk {formatRisk(violation.riskScore)}
+                  </Badge>
+                </InlineStack>
+                {violation.sourceUrl && (
+                  <Link url={violation.sourceUrl} target="_blank">
+                    Reference
+                  </Link>
+                )}
+              </InlineStack>
+              <Text variant="bodySm" as="p">
+                <strong>{violation.policy}</strong> · {violation.law}
+              </Text>
+              <Text variant="bodySm" tone="subdued" as="p">
+                {violation.issue}
+              </Text>
+            </div>
+          ))}
+        </Stack>
       ) : (
-        <Stack gap="200">
-          {result.issues.map((issue) => (
-            <Text key={`${result.productId}-${issue}`} as="span" tone="critical">
-              {issue}
+        <Badge tone="success">No violations</Badge>
+      ),
+      hasViolations ? (
+        <Stack key={`${result.productId}-suggestions`} vertical spacing="200">
+          {result.violations.map((violation, index) => (
+            <Text key={`${result.productId}-suggestion-${index}`} variant="bodySm" as="p">
+              {violation.suggestion}
             </Text>
           ))}
         </Stack>
-      )}
-    </div>,
-    <div key={`${result.productId}-phrases`}>
-      {(phraseDrafts[result.productId] ?? []).length === 0 ? (
-        <Text tone="subdued">No problematic phrases detected.</Text>
       ) : (
-        phraseDrafts[result.productId].map((phrase, index) => (
-          <div key={`${result.productId}-phrase-${index}`} style={{ marginBottom: "var(--p-space-300)" }}>
-            <Text variant="bodySm" tone="critical">
-              Flagged: {phrase.original || "(phrase not found)"}
-            </Text>
-            <TextField
-              labelHidden
-              label={`Replacement ${index + 1}`}
-              value={phrase.replacement}
-              onChange={(value) => handleReplacementChange(result.productId, index, value)}
-              multiline
-            />
-            <Text variant="bodySm" tone="subdued">
-              {phrase.reason}
-            </Text>
-          </div>
-        ))
-      )}
-    </div>,
-    <InlineStack key={`${result.productId}-actions`} gap="200" blockAlign="center">
-      <applyFetcher.Form method="post">
-        <input type="hidden" name="intent" value="applySuggestion" />
-        <input type="hidden" name="productId" value={result.productId} />
-        <input
-          type="hidden"
-          name="phrases"
-          value={JSON.stringify(phraseDrafts[result.productId] ?? [])}
-        />
-        <Button
-          size="slim"
-          submit
-          disabled={
-            (phraseDrafts[result.productId] ?? []).length === 0 ||
-            (applyFetcher.state !== "idle" && applyingProductId === result.productId)
-          }
-        >
-          {applyingProductId === result.productId && applyFetcher.state !== "idle" ? (
-            <InlineStack gap="100" blockAlign="center">
-              <Spinner size="small" />
-              <span>Applying…</span>
-            </InlineStack>
-          ) : (
-            "Apply AI Fix"
-          )}
-        </Button>
-      </applyFetcher.Form>
-      <Button size="slim" variant="plain">
-        Edit & Apply
-      </Button>
-    </InlineStack>,
-  ]);
+        <Text tone="subdued">No action required.</Text>
+      ),
+    ];
+  });
 
   return (
     <>
@@ -349,13 +242,13 @@ export default function AppScansPage() {
             AI Compliance Scan
           </Text>
           <Text tone="subdued" as="p">
-            Scan {displayedScan?.shopDomain ?? "your store"}'s catalog for Google Ads and regional policy violations across products,
-            descriptions, metadata, and theme content.
+            Scan your catalog for Google Ads and market-specific regulations. Every issue now includes the policy, governing law, severity level, and a risk score so you can justify remediation work immediately.
           </Text>
         </Layout.Section>
+
         <Layout.Section>
           <Banner status="info">
-            This AI-powered scan uses OpenAI to stay up to date with the latest Google Ads and local law policies automatically.
+            This AI-powered scan stays in sync with the latest Google Ads and local law updates. Each violation references the governing rule so your team can document decisions quickly.
           </Banner>
         </Layout.Section>
 
@@ -366,10 +259,10 @@ export default function AppScansPage() {
                 label="Select market to scan"
                 options={MARKETS}
                 value={market}
-                onChange={setMarket}
+                onChange={(value) => setMarket(value)}
               />
               <Text as="p" tone="subdued">
-                Scanning Google Ads policies and local laws for the selected market…
+                We localize each scan to the selected market so policy citations and risk scoring reflect current laws.
               </Text>
               {history.length > 0 && (
                 <Select
@@ -387,22 +280,22 @@ export default function AppScansPage() {
           </Card>
         </Layout.Section>
 
-      <Layout.Section>
-        {aiConnected ? (
-          <Banner status="success" title="AI connection active">
-            Analysis powered by OpenAI GPT-4o-mini.
-          </Banner>
-        ) : (
-          <Banner status="critical" title="AI connection failed">
-            <p>We couldn’t connect to OpenAI. Please check your API key or try again later.</p>
-          </Banner>
-        )}
-      </Layout.Section>
+        <Layout.Section>
+          {aiConnected ? (
+            <Banner status="success" title="AI connection active">
+              Analysis powered by OpenAI GPT-4o-mini.
+            </Banner>
+          ) : (
+            <Banner status="critical" title="AI connection failed">
+              <p>We couldn’t connect to OpenAI. Please check your API key or try again later.</p>
+            </Banner>
+          )}
+        </Layout.Section>
 
-      <Layout.Section>
-        <Layout>
-          {getMetricCards(metrics).map((metric, index) => (
-            <Layout.Section key={metric.title} variant="oneThird">
+        <Layout.Section>
+          <Layout>
+            {getMetricCards(metrics).map((metric) => (
+              <Layout.Section key={metric.title} variant="oneThird">
                 <Card>
                   <Stack spacing="300" alignment="center">
                     <Icon source={metric.icon} tone="primary" />
@@ -427,8 +320,7 @@ export default function AppScansPage() {
         <Layout.Section>
           <Card title="Run New Scan" sectioned>
             <Text as="p" tone="subdued">
-              This scan reviews your product titles, descriptions, URLs, meta data, and theme content for restricted terms, misleading
-              claims, or policy violations. It uses AI to analyze Google Ads and local law guidelines in real time.
+              We pull live product data from Shopify, cross-reference Google Ads and market regulations, and surface every violation with documented policy and law metadata.
             </Text>
             <InlineStack gap="300" blockAlign="center" style={{ marginTop: "var(--p-space-400)" }}>
               <runScanFetcher.Form method="post">
@@ -460,14 +352,6 @@ export default function AppScansPage() {
           </Card>
         </Layout.Section>
 
-        {statusMessage && (
-          <Layout.Section>
-            <Banner status="success" onDismiss={() => setStatusMessage(null)}>
-              {statusMessage}
-            </Banner>
-          </Layout.Section>
-        )}
-
         {scanError && (
           <Layout.Section>
             <Banner status="critical" onDismiss={() => setScanError(null)}>
@@ -485,7 +369,7 @@ export default function AppScansPage() {
                     Scan Results
                   </Text>
                   <Text as="p" tone="subdued">
-                    Review flagged products and apply AI powered fixes instantly.
+                    Every violation includes the Google Ads policy, local law reference, severity badge, and AI remediation note.
                   </Text>
                 </div>
                 <Divider />
@@ -510,11 +394,15 @@ export default function AppScansPage() {
                     </InlineStack>
                   )}
                 </InlineStack>
-                <DataTable
-                  columnContentTypes={["text", "text", "text", "text"]}
-                  headings={["Product", "Issues", "AI Suggestion", "Actions"]}
-                  rows={rows}
-                />
+                {visibleResults.length === 0 ? (
+                  <Text tone="subdued">No products matched this page.</Text>
+                ) : (
+                  <DataTable
+                    columnContentTypes={["text", "text", "text"]}
+                    headings={["Product", "Policy & Law Context", "AI Guidance"]}
+                    rows={rows}
+                  />
+                )}
               </Stack>
             </Card>
           </Layout.Section>
@@ -538,8 +426,7 @@ export default function AppScansPage() {
       >
         <Modal.Section>
           <Text as="p" tone="subdued">
-            Batch remediation, scheduling, and policy exports are available on the Growth and Agency plans. Contact support to enable
-            these features.
+            Batch remediation, scheduling, and policy exports are available on the Growth and Agency plans. Contact support to enable these features.
           </Text>
         </Modal.Section>
       </Modal>
@@ -560,32 +447,21 @@ function formatTimestamp(value: string) {
 }
 
 function serializeScan(scan: Scan): SerializedScan {
+  const rawResults = (scan.results as ComplianceFinding[] | undefined) ?? [];
   return {
     ...scan,
     startedAt: scan.startedAt.toISOString(),
     completedAt: scan.completedAt ? scan.completedAt.toISOString() : null,
-    results: (scan.results as ComplianceFinding[] | null) ?? [],
+    results: rawResults.map((raw) => normalizeFinding(raw, { market: scan.market, shopDomain: scan.shopDomain })),
   };
 }
 
-function applyPhraseSuggestions(html: string, phrases: PhraseSuggestion[]) {
-  if (!phrases.length) return html;
-  return phrases.reduce((acc, phrase) => {
-    if (!phrase.original || !phrase.replacement) return acc;
-    const regex = new RegExp(escapeRegExp(phrase.original), "gi");
-    return acc.replace(regex, phrase.replacement);
-  }, html);
-}
-
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-async function runComplianceScan({ admin, session, market }: any) {
+async function runComplianceScan({ admin, session, market }: { admin: any; session: any; market: string }) {
   const products = await fetchAllProducts(admin);
   if (!products.length) {
     throw new Error("No products found to scan.");
   }
+
   const rules = getPolicyRules(market);
   const openAiClient = openai;
   if (!openAiClient) {
@@ -595,11 +471,17 @@ async function runComplianceScan({ admin, session, market }: any) {
   const results: ComplianceFinding[] = [];
 
   for (const product of products) {
-    const finding = await analyzeProduct({ product, rules, market, openAiClient });
+    const finding = await analyzeProduct({
+      product,
+      rules,
+      market,
+      openAiClient,
+      shopDomain: session.shop,
+    });
     results.push(finding);
   }
 
-  const violations = results.filter((result) => result.status === "flagged").length;
+  const violationCount = results.reduce((sum, result) => sum + result.violations.length, 0);
   const complianceScore = results.length
     ? Math.round(results.reduce((sum, r) => sum + r.complianceScore, 0) / results.length)
     : 100;
@@ -609,7 +491,7 @@ async function runComplianceScan({ admin, session, market }: any) {
       shopDomain: session.shop,
       market,
       complianceScore,
-      violations,
+      violations: violationCount,
       productsScanned: results.length,
       status: "complete",
       completedAt: new Date(),
@@ -633,7 +515,6 @@ async function fetchAllProducts(admin: any, batchSize = 50) {
     const pageInfo = body?.data?.products?.pageInfo;
     hasNextPage = Boolean(pageInfo?.hasNextPage);
     after = pageInfo?.endCursor ?? null;
-    if (!hasNextPage) break;
   }
 
   return products;
@@ -644,11 +525,13 @@ async function analyzeProduct({
   rules,
   market,
   openAiClient,
+  shopDomain,
 }: {
   product: any;
   rules: PolicyRule[];
   market: string;
   openAiClient: any;
+  shopDomain: string;
 }): Promise<ComplianceFinding> {
   const plainDescription = stripHtml(product.descriptionHtml ?? "");
   const metafieldsText = (product.metafields?.edges ?? [])
@@ -657,41 +540,29 @@ async function analyzeProduct({
   const combined = `${product.title}\n${plainDescription}\n${product.tags?.join(" ") ?? ""}\n${metafieldsText}`.toLowerCase();
 
   const matches = detectPolicyMatches(combined, rules);
-  const issues = matches.map((match) => `${match.rule.category}: ${match.rule.description}`);
+  const heuristicViolations = buildHeuristicViolations(matches, market, product.title);
 
-  const basePenalty = matches.reduce((sum, match) => sum + (match.rule.severity === "high" ? 30 : match.rule.severity === "medium" ? 15 : 5), 0);
-  const baseScore = Math.max(0, 100 - basePenalty);
-  const fallbackSuggestions: PhraseSuggestion[] = matches.length
-    ? matches.map((match) => ({
-        original: match.matchingWords[0] ?? "",
-        replacement: `Replace "${match.matchingWords[0]}" with compliant phrasing`,
-        reason: match.rule.description,
-      }))
-    : [];
-
-  const phraseSuggestions = await buildAiSuggestions({
+  const aiViolations = await buildAiViolations({
     openAiClient,
     market,
     productTitle: product.title,
     description: plainDescription,
-    hints: matches.map((match) => match.rule.description),
-    fallback: fallbackSuggestions,
+    url: product.onlineStoreUrl,
+    policyHints: heuristicViolations.map((violation) => `${violation.policy}: ${violation.issue}`),
   });
 
-  const status: "flagged" | "clean" = issues.length || phraseSuggestions.length ? "flagged" : "clean";
-  const complianceScore = Math.max(0, baseScore - phraseSuggestions.length * 10);
+  const combinedViolations = dedupeViolations([...heuristicViolations, ...aiViolations]);
+  const complianceScore = calculateComplianceScore(combinedViolations);
 
   return {
     productId: product.id,
     legacyResourceId: product.legacyResourceId?.toString(),
     productTitle: product.title,
     market,
-    matchedKeywords: matches.flatMap((match) => match.matchingWords),
-    issues,
-    policyArea: matches.map((m) => m.rule.category).join(", ") || "None",
-    phrases: phraseSuggestions,
+    shopDomain,
+    violations: combinedViolations,
     complianceScore,
-    status,
+    status: combinedViolations.length ? "flagged" : "clean",
   };
 }
 
@@ -704,53 +575,237 @@ function detectPolicyMatches(text: string, rules: PolicyRule[]) {
     .filter(Boolean) as { rule: PolicyRule; matchingWords: string[] }[];
 }
 
-async function buildAiSuggestions({
+function buildHeuristicViolations(
+  matches: { rule: PolicyRule; matchingWords: string[] }[],
+  market: string,
+  productTitle: string,
+): ComplianceViolation[] {
+  if (!matches.length) return [];
+  const lawReference = getMarketLawReference(market);
+
+  return matches.map(({ rule, matchingWords }) => {
+    const severity = toSeverityLabel(rule.severity);
+    return {
+      issue: `${rule.description}. Flagged terms: ${matchingWords.join(", ")}.`,
+      policy: `Google Ads – ${rule.category}`,
+      law: lawReference.law,
+      severity,
+      riskScore: severityToRiskScore(severity),
+      suggestion: `Rephrase references to ${matchingWords[0] ?? productTitle} to align with ${lawReference.law}.`,
+      sourceUrl: lawReference.url,
+    };
+  });
+}
+
+async function buildAiViolations({
   openAiClient,
   market,
   productTitle,
   description,
-  hints,
-  fallback,
+  url,
+  policyHints,
 }: {
   openAiClient: any;
   market: string;
   productTitle: string;
   description: string;
-  hints: string[];
-  fallback: PhraseSuggestion[];
-}): Promise<PhraseSuggestion[]> {
-  if (!openAiClient) return fallback;
+  url?: string | null;
+  policyHints: string[];
+}): Promise<ComplianceViolation[]> {
+  if (!openAiClient) return [];
+
+  const lawReference = getMarketLawReference(market);
+  const truncatedDescription = description.slice(0, 3500);
+  const hints = policyHints.slice(0, 6).join("\n");
 
   try {
     const completion = await openAiClient.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.2,
+      temperature: 0.1,
       response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
           content:
-            "You are a Google Ads and local law compliance reviewer. Identify risky phrases and offer compliant replacements. Limit replacements to short snippets (max 15 words).",
+            "You are a compliance analyst for Shopify merchants. Compare product data to Google Ads policies and the specified market's ecommerce laws. Return structured JSON only.",
         },
         {
           role: "user",
-          content: `Market: ${market.toUpperCase()}\nProduct: ${productTitle}\nDescription: ${description}\nKnown heuristics: ${hints.join("; ") || "None"}\nReturn JSON {"phrases": [{"original":"", "replacement":"", "reason":""}, ...]}. Only include phrases that actually appear in the text and explain why they're risky.`,
+          content: `Market: ${market.toUpperCase()}
+Local law focus: ${lawReference.law}
+Product title: ${productTitle}
+Product description: ${truncatedDescription}
+Product URL: ${url ?? "N/A"}
+Known heuristic flags: ${hints || "None"}
+Return JSON {"violations":[{"issue":"","policy":"","law":"","severity":"High|Medium|Low","riskScore":0-1,"suggestion":"","sourceUrl":""}]}.` ,
         },
       ],
     });
 
     const content = completion.choices?.[0]?.message?.content;
-    if (!content) return fallback;
+    if (!content) return [];
     const parsed = JSON.parse(content);
-    if (Array.isArray(parsed.phrases)) {
-      return parsed.phrases.filter((phrase: any) => phrase?.original && phrase?.replacement);
+    if (Array.isArray(parsed.violations)) {
+      return parsed.violations
+        .map((violation: any) => normalizeViolation(violation, market))
+        .filter((violation): violation is ComplianceViolation => Boolean(violation.issue));
     }
-    return fallback;
+    return [];
   } catch (error) {
-    console.error("OpenAI phrase generation failed", error);
-    return fallback;
+    console.error("OpenAI violation generation failed", error);
+    return [];
   }
 }
+
+function dedupeViolations(violations: ComplianceViolation[]) {
+  const seen = new Set<string>();
+  return violations.filter((violation) => {
+    const key = `${violation.issue}|${violation.policy}|${violation.law}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function calculateComplianceScore(violations: ComplianceViolation[]) {
+  if (!violations.length) return 100;
+  const penalty = violations.reduce((sum, violation) => sum + violation.riskScore * 35, 0);
+  return Math.max(0, Math.round(100 - penalty));
+}
+
+function normalizeFinding(raw: any, fallback: { market: string; shopDomain: string }): ComplianceFinding {
+  const productId = raw?.productId ?? raw?.id ?? "unknown";
+  const market = raw?.market ?? fallback.market;
+  const violations = Array.isArray(raw?.violations)
+    ? raw.violations
+        .map((violation: any) => normalizeViolation(violation, market))
+        .filter((violation): violation is ComplianceViolation => Boolean(violation.issue))
+    : legacyViolationsFromIssues(raw, market);
+
+  return {
+    productId,
+    legacyResourceId: raw?.legacyResourceId ?? undefined,
+    productTitle: raw?.productTitle ?? raw?.title ?? "Untitled product",
+    market,
+    shopDomain: raw?.shopDomain ?? fallback.shopDomain,
+    violations,
+    complianceScore:
+      typeof raw?.complianceScore === "number" ? raw.complianceScore : calculateComplianceScore(violations),
+    status: raw?.status ?? (violations.length ? "flagged" : "clean"),
+  };
+}
+
+function legacyViolationsFromIssues(raw: any, market: string): ComplianceViolation[] {
+  if (!Array.isArray(raw?.issues) || raw.issues.length === 0) return [];
+  const lawReference = getMarketLawReference(market);
+  return raw.issues.map((issue: string) => ({
+    issue,
+    policy: raw?.policyArea ? `Google Ads – ${raw.policyArea}` : "Google Ads restricted content",
+    law: lawReference.law,
+    severity: "Medium",
+    riskScore: 0.5,
+    suggestion: "Update the copy to remove or soften this claim.",
+    sourceUrl: lawReference.url,
+  }));
+}
+
+function normalizeViolation(raw: any, market: string): ComplianceViolation {
+  if (!raw) {
+    return {
+      issue: "Potential compliance issue",
+      policy: "Google Ads restricted content",
+      law: getMarketLawReference(market).law,
+      severity: "Medium",
+      riskScore: 0.5,
+      suggestion: "Review this content for compliance.",
+    };
+  }
+
+  const severity = normalizeSeverity(raw.severity);
+  const riskSource = typeof raw.riskScore === "number" ? raw.riskScore : severityToRiskScore(severity);
+  const lawReference = raw.law ?? getMarketLawReference(market).law;
+
+  return {
+    issue: String(raw.issue ?? raw.reason ?? "Potential compliance issue"),
+    policy: String(raw.policy ?? "Google Ads restricted content"),
+    law: String(lawReference),
+    severity,
+    riskScore: clampRiskScore(riskSource),
+    suggestion: String(raw.suggestion ?? raw.replacement ?? "Update this content to comply."),
+    sourceUrl: raw.sourceUrl ?? getMarketLawReference(market).url,
+  };
+}
+
+function normalizeSeverity(value: unknown): ComplianceViolation["severity"] {
+  if (typeof value !== "string") return "Medium";
+  const upper = value.toLowerCase();
+  if (upper === "high") return "High";
+  if (upper === "low") return "Low";
+  return "Medium";
+}
+
+function toSeverityLabel(value: PolicyRule["severity"]): ComplianceViolation["severity"] {
+  return value === "high" ? "High" : value === "low" ? "Low" : "Medium";
+}
+
+function severityTone(severity: ComplianceViolation["severity"]) {
+  if (severity === "High") return "critical";
+  if (severity === "Medium") return "warning";
+  return "success";
+}
+
+function severityToRiskScore(severity: ComplianceViolation["severity"]) {
+  if (severity === "High") return 0.92;
+  if (severity === "Medium") return 0.6;
+  return 0.3;
+}
+
+function riskTone(score: number) {
+  if (score >= 0.75) return "critical";
+  if (score >= 0.4) return "warning";
+  return "success";
+}
+
+function formatRisk(score: number) {
+  return `${Math.round(clampRiskScore(score) * 100)}%`;
+}
+
+function clampRiskScore(score: number) {
+  if (Number.isNaN(score)) return 0.5;
+  return Math.min(1, Math.max(0, score));
+}
+
+function getMarketLawReference(market: string) {
+  const key = market.toLowerCase();
+  return MARKET_LAW_REFERENCES[key] ?? MARKET_LAW_REFERENCES.default;
+}
+
+const MARKET_LAW_REFERENCES: Record<string, { law: string; url?: string }> = {
+  uk: {
+    law: "UK CAP Code, ASA guidance & DfT product marketing rules",
+    url: "https://www.gov.uk/government/publications/e-scooter-trials-guidance-for-users",
+  },
+  us: {
+    law: "US FTC truth-in-advertising & FDA marketing guidance",
+    url: "https://www.ftc.gov/business-guidance/advertising-marketing",
+  },
+  eu: {
+    law: "EU Consumer Protection Regulation & Google Merchant Center EU policies",
+    url: "https://europa.eu/youreurope/business/product-requirements/index_en.htm",
+  },
+  au: {
+    law: "Australia ACCC advertising rules & TGA code",
+    url: "https://www.tga.gov.au/resources/resource/guidance/advertising-code",
+  },
+  ca: {
+    law: "Canada Competition Bureau advertising standards",
+    url: "https://www.competitionbureau.gc.ca/eic/site/cb-bc.nsf/eng/03031.html",
+  },
+  default: {
+    law: "Local consumer protection and Google Ads policies",
+    url: "https://support.google.com/adspolicy",
+  },
+};
 
 function stripHtml(raw: string) {
   return raw.replace(/<[^>]*>?/g, " ").replace(/\s+/g, " ").trim();
