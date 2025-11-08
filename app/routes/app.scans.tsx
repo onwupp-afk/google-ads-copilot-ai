@@ -30,7 +30,6 @@ import {
   Link,
   Modal,
   Popover,
-  ProgressBar,
   Select,
   SkeletonBodyText,
   SkeletonDisplayText,
@@ -55,7 +54,6 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { AnimatePresence, motion } from "framer-motion";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import {
@@ -177,15 +175,6 @@ export default function ComplianceDashboardPage() {
   const [localHistory, setLocalHistory] = useState(history);
   const [pendingApplyProductId, setPendingApplyProductId] = useState<string | null>(null);
   const [bulkApplying, setBulkApplying] = useState(false);
-  const initialScanResults = scans[0]?.results ?? [];
-  const [scanResults, setScanResults] = useState<ComplianceFinding[]>(initialScanResults);
-  const [isScanning, setIsScanning] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [totalProducts, setTotalProducts] = useState(0);
-  const [currentProductIndex, setCurrentProductIndex] = useState(0);
-  const [progressLabel, setProgressLabel] = useState("Initializing scan…");
-  const [scanCompleteState, setScanCompleteState] = useState<"idle" | "success" | "error">("idle");
-  const [lastAnimatedScanId, setLastAnimatedScanId] = useState<string | null>(null);
 
   const appBridge = useAppBridge();
 
@@ -204,133 +193,22 @@ export default function ComplianceDashboardPage() {
     return scanHistory.find((scan) => scan.id === selectedScanId) ?? scanHistory[0];
   }, [scanHistory, selectedScanId]);
 
-  const triggerToast = useCallback(
-    (message?: string) => {
-      if (!message || !appBridge) return;
-      const toast = Toast.create(appBridge, { message });
-      toast.dispatch(Toast.Action.SHOW);
-    },
-    [appBridge],
-  );
-
-  const finalizeScan = useCallback(
-    (scan: SerializedScan, toastMessage?: string) => {
-      setScanHistory((prev) => [scan, ...prev].slice(0, 5));
-      setSelectedScanId(scan.id);
+  useEffect(() => {
+    if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
+      setScanHistory((prev) => [runScanFetcher.data!.scan, ...prev].slice(0, 5));
+      setSelectedScanId(runScanFetcher.data.scan.id);
       setCurrentPage(0);
       setLocalHistory((prev) => [
         ...prev,
-        ...scan.results.map((result) => ({
+        ...runScanFetcher.data!.scan.results.map((result) => ({
           productId: result.productId,
-          scannedAt: scan.completedAt ?? new Date().toISOString(),
+          scannedAt: new Date().toISOString(),
           complianceScore: result.complianceScore ?? 0,
         })),
       ]);
-      setScanResults(scan.results);
-      if (toastMessage) {
-        triggerToast(toastMessage);
-      }
-    },
-    [setScanHistory, setSelectedScanId, setCurrentPage, setLocalHistory, triggerToast],
-  );
-
-useEffect(() => {
-  if (runScanFetcher.state === "submitting" && runScanFetcher.formData?.get("intent") === "startScan") {
-    setIsScanning(true);
-    setScanCompleteState("idle");
-    setProgress(5);
-    setProgressLabel("Preparing scan…");
-    setTotalProducts(0);
-    setCurrentProductIndex(0);
-  }
-}, [runScanFetcher.state, runScanFetcher.formData]);
-
-useEffect(() => {
-  if (!runScanFetcher.data) {
-    return undefined;
-  }
-
-  if (runScanFetcher.data.error) {
-    if (scanCompleteState !== "error") {
-      setIsScanning(false);
-      setScanCompleteState("error");
-      triggerToast(runScanFetcher.data.error);
+      triggerToast(runScanFetcher.data.toast);
     }
-    return undefined;
-  }
-
-  const scan = runScanFetcher.data.scan;
-  if (!scan || scan.id === lastAnimatedScanId) {
-    return undefined;
-  }
-
-  setLastAnimatedScanId(scan.id);
-  setIsScanning(true);
-  setScanCompleteState("idle");
-  const total = Math.max(scan.results.length || scan.productsScanned || 1, 1);
-  setTotalProducts(total);
-  setCurrentProductIndex(0);
-  setProgress(0);
-  setProgressLabel("Scanning products…");
-  setScanResults([]);
-
-  const delay = 450;
-  const placeholderResults = scan.results.length
-    ? scan.results
-    : Array.from({ length: total }).map((_, index) => ({
-        productId: `placeholder-${index}`,
-        productTitle: `Product ${index + 1}`,
-        legacyResourceId: undefined,
-        productHandle: null,
-        thumbnailUrl: null,
-        originalDescription: "",
-        originalHtml: undefined,
-        market: scan.market,
-        shopDomain: scan.shopDomain,
-        violations: [],
-        complianceScore: 100,
-        status: "clean",
-      } as ComplianceFinding));
-
-  let cancelled = false;
-  const timeouts: ReturnType<typeof setTimeout>[] = [];
-
-  const step = (index: number) => {
-    if (cancelled) return;
-    const clampedIndex = Math.min(index, total - 1);
-    setCurrentProductIndex(clampedIndex);
-    setProgress(Math.min(100, Math.round(((clampedIndex + 1) / total) * 100)));
-    setProgressLabel(`Scanning product ${Math.min(clampedIndex + 1, total)} of ${total}`);
-    setScanResults(placeholderResults.slice(0, Math.min(clampedIndex + 1, placeholderResults.length)));
-
-    if (clampedIndex + 1 < total) {
-      timeouts.push(setTimeout(() => step(clampedIndex + 1), delay));
-    } else {
-      timeouts.push(
-        setTimeout(() => {
-          if (cancelled) return;
-          finalizeScan(scan, runScanFetcher.data?.toast);
-          setScanResults(scan.results);
-          setIsScanning(false);
-          setScanCompleteState("success");
-        }, delay),
-      );
-    }
-  };
-
-  timeouts.push(setTimeout(() => step(0), 200));
-
-  return () => {
-    cancelled = true;
-    timeouts.forEach(clearTimeout);
-  };
-}, [runScanFetcher.data, finalizeScan, triggerToast, lastAnimatedScanId, scanCompleteState]);
-
-useEffect(() => {
-  if (!isScanning && displayedScan) {
-    setScanResults(displayedScan.results);
-  }
-}, [isScanning, displayedScan]);
+  }, [runScanFetcher.state, runScanFetcher.data, triggerToast]);
 
   useEffect(() => {
     if (rescanFetcher.state === "idle" && rescanFetcher.data?.scan) {
@@ -375,16 +253,11 @@ useEffect(() => {
   const summaryMetrics = useMemo(() => buildSummary(scanHistory), [scanHistory]);
   const chartHistoryByProduct = useMemo(() => groupHistory(localHistory), [localHistory]);
 
-  const activeResults = useMemo(() => {
-    if (isScanning) return scanResults;
-    if (displayedScan) return displayedScan.results;
-    return scanResults;
-  }, [isScanning, scanResults, displayedScan]);
-
   const visibleResults = useMemo(() => {
+    if (!displayedScan) return [];
     const start = currentPage * RESULTS_PER_PAGE;
-    return activeResults.slice(start, start + RESULTS_PER_PAGE);
-  }, [activeResults, currentPage]);
+    return displayedScan.results.slice(start, start + RESULTS_PER_PAGE);
+  }, [displayedScan, currentPage]);
 
   const scanHistoryOptions = scanHistory.map((scan) => ({
     label: `${scan.market.toUpperCase()} • ${formatTimestamp(scan.completedAt ?? scan.startedAt)}`,
@@ -418,6 +291,15 @@ useEffect(() => {
         ]}
       />
     </Popover>
+  );
+
+  const triggerToast = useCallback(
+    (message?: string) => {
+      if (!message || !appBridge) return;
+      const toast = Toast.create(appBridge, { message });
+      toast.dispatch(Toast.Action.SHOW);
+    },
+    [appBridge],
   );
 
   const handlePreview = useCallback((result: ComplianceFinding) => {
@@ -489,13 +371,6 @@ useEffect(() => {
     },
     [triggerToast],
   );
-
-  const estimatedSecondsLeft = useMemo(() => {
-    if (!isScanning || !totalProducts) return null;
-    const remaining = Math.max(totalProducts - currentProductIndex - 1, 0);
-    const perProductSeconds = 0.5;
-    return Math.ceil(remaining * perProductSeconds);
-  }, [isScanning, totalProducts, currentProductIndex]);
 
   return (
     <Layout>
@@ -657,69 +532,7 @@ useEffect(() => {
       </Layout.Section>
 
       <Layout.Section>
-        <AnimatePresence>
-          {isScanning && (
-            <motion.div
-              key="scan-progress"
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-            >
-              <Card>
-                <Stack vertical spacing="300">
-                  <InlineStack align="space-between" blockAlign="center">
-                    <Text variant="bodyMd">{progressLabel}</Text>
-                    <Text tone="subdued">{progress}%</Text>
-                  </InlineStack>
-                  <ProgressBar progress={progress} size="small" tone="primary" />
-                  {totalProducts > 0 && (
-                    <InlineStack gap="200" blockAlign="center">
-                      <Text tone="subdued">
-                        Scanning product {Math.min(currentProductIndex + 1, totalProducts)} of {totalProducts}
-                      </Text>
-                      {estimatedSecondsLeft !== null && (
-                        <Text tone="subdued">Estimated time left {estimatedSecondsLeft}s</Text>
-                      )}
-                    </InlineStack>
-                  )}
-                </Stack>
-              </Card>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        {!isScanning && scanCompleteState === "success" && (
-          <motion.div
-            key="scan-success"
-            initial={{ opacity: 0, y: -5 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.3 }}
-          >
-            <Card subdued>
-              <InlineStack gap="200" blockAlign="center">
-                <Icon source={CheckCircleIcon} tone="success" />
-                <Text>Scan complete — results updated below.</Text>
-              </InlineStack>
-            </Card>
-          </motion.div>
-        )}
-        {!isScanning && scanCompleteState === "error" && (
-          <motion.div
-            key="scan-error"
-            initial={{ opacity: 0, y: -5 }}
-            animate={{ opacity: 1, y: 0 }}
-          >
-            <Card subdued>
-              <InlineStack gap="200" blockAlign="center">
-                <Icon source={AlertCircleIcon} tone="critical" />
-                <Text>Scan failed — please try again.</Text>
-              </InlineStack>
-            </Card>
-          </motion.div>
-        )}
-      </Layout.Section>
-
-      <Layout.Section>
-        {activeResults.length ? (
+        {displayedScan ? (
           <Stack vertical spacing="400">
             {visibleResults.map((result) => (
               <ProductResultCard
@@ -878,14 +691,6 @@ function ProductResultCard({
               <Text variant="headingSm" as="h3">
                 {result.productTitle}
               </Text>
-              {hasViolations && (
-                <InlineStack gap="100" blockAlign="center">
-                  <Icon source={AlertCircleIcon} tone="critical" />
-                  <Text tone="critical" variant="bodySm">
-                    Attention needed
-                  </Text>
-                </InlineStack>
-              )}
               <Text tone="subdued" as="p">
                 {shopDomain}
               </Text>
