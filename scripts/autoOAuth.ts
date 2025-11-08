@@ -1,168 +1,110 @@
 import "dotenv/config";
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
-import { setTimeout as sleep } from "node:timers/promises";
 
 import open from "open";
-import prisma from "../app/db.server";
+import { PrismaClient } from "@prisma/client";
 
 const POLL_INTERVAL_MS = 2000;
 const TIMEOUT_MS = 4 * 60 * 1000;
 
-type EnvConfig = {
-  shopDomain: string;
-  appUrl: string;
-  envPath: string;
-  adminToken: string | null;
-  apiKey: string;
-  scopes: string;
-  authCallbackUrl: string;
-  environment: "production" | "development";
-};
-
-type SessionSnapshot = {
-  id: string;
-  accessToken: string | null;
-  expires: Date | null;
-};
-
 async function main() {
   const env = resolveEnv();
-
-  console.log(`SHOPIFY_APP_URL → ${env.appUrl}`);
-  console.log(`SHOPIFY_API_KEY → ${env.apiKey}`);
-
-  const session = await ensureOfflineSession(env.shopDomain);
-  const tokenState = await getTokenState(env, session);
-
-  if (tokenState.status === "valid") {
-    console.log("✅ Existing token valid — skipping OAuth");
-    await upsertEnvTokenWithRetry(env.envPath, tokenState.token);
-    await upsertSessionToken(session.id, tokenState.token);
-    console.log("✅ Token validated");
-    await prisma.$disconnect();
-    return;
-  }
-
-  console.log("⚙️ Running OAuth handshake...");
-  await performHandshake(env, session.id);
-
-  const refreshedToken = await getTokenState(env, session);
-  if (refreshedToken.status !== "valid") {
-    console.error("❌ OAuth handshake failed — no token available after retry.");
-    process.exitCode = 1;
-    await prisma.$disconnect();
-    return;
-  }
-
-  await upsertEnvTokenWithRetry(env.envPath, refreshedToken.token);
-  await upsertSessionToken(session.id, refreshedToken.token);
-
-  console.log("🔑 Token received and stored successfully");
-  console.log("✅ Token validated");
-
-  await prisma.$disconnect();
-}
-
-async function performHandshake(env: EnvConfig, sessionId: string) {
-  const redirectUri =
-    env.environment === "production"
-      ? "https://aithorapp.co.uk/api/auth/callback"
-      : env.authCallbackUrl || `${stripTrailingSlash(env.appUrl)}/api/auth/callback`;
-
-  const state = generateState(sessionId);
-  const installUrl = `https://${env.shopDomain}/admin/oauth/install?client_id=${encodeURIComponent(
-    env.apiKey,
-  )}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(
-    env.scopes,
-  )}&state=${encodeURIComponent(state)}`;
-
-  console.log(`🌐 Opening install URL: ${installUrl}`);
-  await open(installUrl);
+  const prisma = createPrisma(env.sessionDbUrl);
 
   try {
-    const token = await waitForToken(env.shopDomain);
-    await upsertEnvTokenWithRetry(env.envPath, token);
-    await upsertSessionToken(sessionId, token);
+    const handshakeUrl = buildHandshakeUrl(env.appUrl, env.shopDomain);
+    console.log(`🔗 Opening OAuth handshake: ${handshakeUrl}`);
+    await open(handshakeUrl);
+
+    const token = await waitForToken(prisma, env.shopDomain);
+    await upsertEnvToken(env.envPath, token);
+
+    console.log(`✅ OAuth handshake complete — Admin API token saved (${maskToken(token)})`);
   } catch (error) {
-    console.error(
-      "❌ Timed out waiting for the Admin API token. Approve the app in the Shopify window, then rerun npm run auto:oauth.",
-    );
+    console.error("❌ OAuth failed — please check redirect URLs");
     if (error instanceof Error) {
       console.error(error.message);
     }
-    throw error;
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect().catch(() => {});
   }
 }
 
-function resolveEnv(): EnvConfig {
-  const envPath = path.resolve(process.cwd(), ".env");
+main();
 
+function resolveEnv() {
   const shopDomain = requireEnv("SHOP_DOMAIN");
-  const rawAppUrl = requireEnv("SHOPIFY_APP_URL");
-  const adminToken =
-    process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN &&
-    process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN.trim().length > 0
-      ? process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN.trim()
-      : null;
+  const appUrl = stripTrailingSlash(requireEnv("SHOPIFY_APP_URL"));
+  const envPath = path.resolve(process.cwd(), ".env");
+  const sessionDbUrl = resolveSessionDbUrl();
 
   return {
     shopDomain,
-    appUrl: stripTrailingSlash(rawAppUrl),
+    appUrl,
     envPath,
-    adminToken,
-    apiKey: requireEnv("SHOPIFY_API_KEY"),
-    scopes: requireEnv("SCOPES"),
-    authCallbackUrl:
-      process.env.SHOPIFY_AUTH_CALLBACK_URL &&
-      process.env.SHOPIFY_AUTH_CALLBACK_URL.trim().length > 0
-        ? process.env.SHOPIFY_AUTH_CALLBACK_URL.trim()
-        : `${stripTrailingSlash(rawAppUrl)}/auth/callback`,
-    environment: process.env.NODE_ENV === "production" ? "production" : "development",
-  };
+    sessionDbUrl,
+  } as const;
 }
 
-function requireEnv(key: string): string {
-  const value = process.env[key];
-  if (!value || value.trim().length === 0) {
-    throw new Error(`${key} is missing from environment variables.`);
+function resolveSessionDbUrl() {
+  const configured = process.env.SHOPIFY_SESSION_DB?.trim();
+  if (configured) {
+    if (/^[a-z]+:\/\//i.test(configured)) {
+      return configured;
+    }
+    const absolutePath = path.isAbsolute(configured)
+      ? configured
+      : path.join(process.cwd(), configured);
+    if (existsSync(absolutePath)) {
+      return `file:${absolutePath}`;
+    }
+    console.warn(`[autoOAuth] Session DB not found at ${absolutePath}. Falling back to DATABASE_URL.`);
   }
-  return value;
+
+  const fallback = process.env.DATABASE_URL || process.env.DIRECT_DATABASE_URL;
+  if (!fallback) {
+    throw new Error("DATABASE_URL (or DIRECT_DATABASE_URL) is required to poll Shopify sessions.");
+  }
+  return fallback;
 }
 
-function stripTrailingSlash(url: string) {
-  return url.replace(/\/$/, "");
+function buildHandshakeUrl(appUrl: string, shopDomain: string) {
+  const base = appUrl.replace(/\/$/, "");
+  const url = `${base}/auth/login?shop=${encodeURIComponent(shopDomain)}`;
+  return url;
 }
 
-async function waitForToken(shopDomain: string) {
+function createPrisma(url: string) {
+  return new PrismaClient({
+    datasources: {
+      db: { url },
+    },
+  });
+}
+
+async function waitForToken(prisma: PrismaClient, shopDomain: string) {
   const deadline = Date.now() + TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    const token = await attemptTokenLookup(shopDomain);
-    if (token) {
-      return token;
+    const record = await prisma.session.findFirst({
+      where: {
+        shop: shopDomain,
+        accessToken: { not: null },
+      },
+      orderBy: { updatedAt: "desc" },
+    });
+
+    if (record?.accessToken) {
+      return record.accessToken.trim();
     }
+
     await sleep(POLL_INTERVAL_MS);
   }
 
-  throw new Error("Timed out while waiting for the Admin API token.");
-}
-
-async function attemptTokenLookup(shopDomain: string): Promise<string | null> {
-  const session = await prisma.session.findFirst({
-    where: {
-      shop: shopDomain,
-      accessToken: {
-        not: null,
-      },
-    },
-    orderBy: {
-      updatedAt: "desc",
-    },
-  });
-
-  return session?.accessToken ?? null;
+  throw new Error("Timed out waiting for Shopify Admin API token. Approve the app in the browser and rerun npm run auto:oauth.");
 }
 
 async function upsertEnvToken(envPath: string, token: string) {
@@ -173,120 +115,43 @@ async function upsertEnvToken(envPath: string, token: string) {
     contents = "";
   }
 
-  const lines = contents.split(/\r?\n/);
-  let replaced = false;
+  const normalized = contents.replace(/\r\n/g, "\n");
+  const lines = normalized.length ? normalized.split("\n") : [];
+  let tokenLineFound = false;
 
-  const updated = lines.map((line) => {
+  const nextLines = lines.map((line) => {
     if (line.startsWith("SHOPIFY_ADMIN_API_ACCESS_TOKEN=")) {
-      replaced = true;
+      tokenLineFound = true;
       return `SHOPIFY_ADMIN_API_ACCESS_TOKEN=${token}`;
     }
     return line;
   });
 
-  if (!replaced) {
-    updated.push(`SHOPIFY_ADMIN_API_ACCESS_TOKEN=${token}`);
+  if (!tokenLineFound) {
+    nextLines.push(`SHOPIFY_ADMIN_API_ACCESS_TOKEN=${token}`);
   }
 
-  await fs.writeFile(
-    envPath,
-    `${updated
-      .filter((line, index) => !(line === "" && index === updated.length - 1))
-      .join("\n")}\n`,
-    "utf8",
-  );
+  const serialized = `${nextLines.join("\n").replace(/\n*$/, "\n")}`;
+  await fs.writeFile(envPath, serialized, "utf8");
 }
 
-async function upsertEnvTokenWithRetry(envPath: string, token: string, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt += 1) {
-    try {
-      await upsertEnvToken(envPath, token);
-      return;
-    } catch (error) {
-      console.error(`Failed to update .env on attempt ${attempt}`, error);
-      if (attempt === retries) {
-        throw error;
-      }
-    }
+function maskToken(token: string) {
+  if (!token) return "";
+  return `${token.slice(0, 6)}••••`;
+}
+
+function requireEnv(key: string) {
+  const value = process.env[key];
+  if (!value || value.trim().length === 0) {
+    throw new Error(`${key} is required`);
   }
+  return value.trim();
 }
 
-async function ensureOfflineSession(shopDomain: string): Promise<SessionSnapshot> {
-  const offlineId = `offline_${shopDomain}`;
-
-  const existing = await prisma.session.findUnique({
-    where: {
-      id: offlineId,
-    },
-  });
-
-  if (existing) {
-    return {
-      id: existing.id,
-      accessToken: existing.accessToken,
-      expires: existing.expires ?? null,
-    };
-  }
-
-  await prisma.session.create({
-    data: {
-      id: offlineId,
-      shop: shopDomain,
-      state: "offline",
-      isOnline: false,
-      scope: process.env.SCOPES ?? "",
-      accessToken: "",
-    },
-  });
-
-  return {
-    id: offlineId,
-    accessToken: "",
-    expires: null,
-  };
+function stripTrailingSlash(value: string) {
+  return value.replace(/\/$/, "");
 }
 
-async function upsertSessionToken(sessionId: string, token: string) {
-  await prisma.session.update({
-    where: { id: sessionId },
-    data: {
-      accessToken: token,
-      isOnline: false,
-    },
-  });
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-async function getTokenState(env: EnvConfig, session: SessionSnapshot) {
-  const latestSession = await prisma.session.findUnique({
-    where: { id: session.id },
-  });
-
-  const token =
-    latestSession?.accessToken ||
-    session.accessToken ||
-    env.adminToken ||
-    (await attemptTokenLookup(env.shopDomain)) ||
-    null;
-
-  if (!token) {
-    return { status: "missing" as const, token: null };
-  }
-
-  const expires = latestSession?.expires ?? session.expires;
-  if (expires && expires <= new Date()) {
-    console.warn("Detected expired Admin API token — forcing re-handshake.");
-    return { status: "expired" as const, token: null };
-  }
-
-  return { status: "valid" as const, token };
-}
-
-function generateState(seed: string) {
-  return `${seed}-${randomUUID()}`;
-}
-
-main().catch(async (error) => {
-  console.error(error);
-  await prisma.$disconnect();
-  process.exit(1);
-});

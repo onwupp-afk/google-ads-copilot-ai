@@ -274,7 +274,7 @@ export async function fetchHistory(shopDomain: string) {
       take: 1000,
     });
   } catch (error: any) {
-    if (error?.code === "P2022") {
+    if (isMissingColumnError(error)) {
       console.warn("ProductScanHistory schema mismatch detected, falling back to empty history", error.message);
       return [];
     }
@@ -302,35 +302,60 @@ async function persistScanArtifacts(
 ) {
   if (!findings.length) return;
 
-  await prisma.scanResult.createMany({
-    data: findings.flatMap((finding) =>
-      finding.violations.map((violation) => ({
-        scanId,
-        productId: finding.productId,
-        productTitle: finding.productTitle,
-        ruleRef: violation.ruleRef,
-        policy: violation.policy,
-        law: violation.law,
-        market,
-        severity: violation.severity,
-        riskScore: violation.riskScore,
-        aiGuidance: violation.suggestion,
-        whyMatters: violation.whyMatters,
-        sourceUrl: violation.sourceUrl,
-      })),
-    ),
-  });
+  await safeCreateMany("scanResult", () =>
+    prisma.scanResult.createMany({
+      data: findings.flatMap((finding) =>
+        finding.violations.map((violation) => ({
+          scanId,
+          productId: finding.productId,
+          productTitle: finding.productTitle,
+          ruleRef: violation.ruleRef,
+          policy: violation.policy,
+          law: violation.law,
+          market,
+          severity: violation.severity,
+          riskScore: violation.riskScore,
+          aiGuidance: violation.suggestion,
+          whyMatters: violation.whyMatters,
+          sourceUrl: violation.sourceUrl,
+        })),
+      ),
+    }),
+  );
 
-  await prisma.productScanHistory.createMany({
-    data: findings.map((finding) => ({
-      scanId,
-      shopDomain,
-      productId: finding.productId,
-      market,
-      complianceScore: finding.complianceScore,
-      violations: finding.violations.length,
-    })),
-  });
+  await safeCreateMany("productScanHistory", () =>
+    prisma.productScanHistory.createMany({
+      data: findings.map((finding) => ({
+        scanId,
+        shopDomain,
+        productId: finding.productId,
+        market,
+        complianceScore: finding.complianceScore,
+        violations: finding.violations.length,
+      })),
+    }),
+  );
+}
+
+async function safeCreateMany<T>(label: string, operation: () => Promise<T>) {
+  try {
+    return await operation();
+  } catch (error: any) {
+    if (isMissingColumnError(error)) {
+      console.warn(
+        `[scan] Skipping ${label} persistence because the current database schema is missing expected columns (runtime fallback).`,
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
+function isMissingColumnError(error: any) {
+  if (!error) return false;
+  if (error.code === "P2022" || error.code === "P2010") return true;
+  const message = error.message?.toLowerCase?.();
+  return message?.includes("does not exist") || message?.includes("unknown column");
 }
 
 async function fetchAllProducts(admin: any, batchSize = 50) {

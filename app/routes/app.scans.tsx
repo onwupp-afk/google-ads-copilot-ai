@@ -309,9 +309,14 @@ export default function ComplianceDashboardPage() {
   }, [scheduleFetcher.state, scheduleFetcher.data, triggerToast]);
 
   useEffect(() => {
-    if (applyFixFetcher.state === "idle" && applyFixFetcher.data?.success) {
-      triggerToast("Product updated");
-      setPendingApplyProductId(null);
+    if (applyFixFetcher.state === "idle") {
+      if (applyFixFetcher.data?.success) {
+        triggerToast("Product updated");
+        setPendingApplyProductId(null);
+      } else if (applyFixFetcher.data?.error) {
+        triggerToast(applyFixFetcher.data.error);
+        setPendingApplyProductId(null);
+      }
     } else if (applyFixFetcher.state === "submitting") {
       const productId = applyFixFetcher.formData?.get("productId")?.toString() ?? null;
       setPendingApplyProductId(productId);
