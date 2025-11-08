@@ -193,6 +193,15 @@ export default function ComplianceDashboardPage() {
     return scanHistory.find((scan) => scan.id === selectedScanId) ?? scanHistory[0];
   }, [scanHistory, selectedScanId]);
 
+  const triggerToast = useCallback(
+    (message?: string) => {
+      if (!message || !appBridge) return;
+      const toast = Toast.create(appBridge, { message });
+      toast.dispatch(Toast.Action.SHOW);
+    },
+    [appBridge],
+  );
+
   useEffect(() => {
     if (runScanFetcher.state === "idle" && runScanFetcher.data?.scan) {
       setScanHistory((prev) => [runScanFetcher.data!.scan, ...prev].slice(0, 5));
@@ -291,15 +300,6 @@ export default function ComplianceDashboardPage() {
         ]}
       />
     </Popover>
-  );
-
-  const triggerToast = useCallback(
-    (message?: string) => {
-      if (!message || !appBridge) return;
-      const toast = Toast.create(appBridge, { message });
-      toast.dispatch(Toast.Action.SHOW);
-    },
-    [appBridge],
   );
 
   const handlePreview = useCallback((result: ComplianceFinding) => {
